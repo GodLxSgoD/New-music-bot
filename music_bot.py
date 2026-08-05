@@ -6,7 +6,7 @@ import yt_dlp as youtube_dl
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-COMMAND_PREFIX = "!"
+DEFAULT_PREFIX = "m"
 # -----------------------------
 
 if not BOT_TOKEN:
@@ -18,10 +18,20 @@ if not BOT_TOKEN:
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+# Prottek server-er jonno alada prefix
+prefixes = {}
+
+
+def get_prefix(bot, message):
+    if message.guild is None:
+        return DEFAULT_PREFIX
+    return prefixes.get(message.guild.id, DEFAULT_PREFIX)
+
+
+bot = commands.Bot(command_prefix=get_prefix, intents=intents)
 
 ytdl_format_options = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[abr>0]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "ytsearch",
@@ -35,7 +45,7 @@ ytdl_format_options = {
 
 ffmpeg_options = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "options": "-vn -b:a 192k -ar 48000",
 }
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
@@ -91,10 +101,14 @@ class MusicControls(discord.ui.View):
         vc = self.ctx.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            await interaction.response.send_message("Pause kora holo.", ephemeral=True)
+            button.label = "Resume"
+            button.style = discord.ButtonStyle.success
+            await interaction.response.edit_message(view=self)
         elif vc and vc.is_paused():
             vc.resume()
-            await interaction.response.send_message("Abar chalu kora holo.", ephemeral=True)
+            button.label = "Pause"
+            button.style = discord.ButtonStyle.secondary
+            await interaction.response.edit_message(view=self)
         else:
             await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
 
@@ -163,6 +177,24 @@ def play_next(ctx):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+
+
+@bot.command(name="setprefix")
+@commands.has_permissions(administrator=True)
+async def setprefix(ctx, new_prefix: str):
+    if len(new_prefix) > 5:
+        await ctx.send("Prefix beshi boro hoye gelo, choto kichu dao (max 5 character).")
+        return
+    prefixes[ctx.guild.id] = new_prefix
+    await ctx.send(f"Prefix change kora holo: **{new_prefix}**")
+
+
+@setprefix.error
+async def setprefix_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Eta korar jonno tomar Admin permission lagbe.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Notun prefix dite hobe, jemon: `!setprefix ?`")
 
 
 @bot.command(name="join")
@@ -300,3 +332,4 @@ async def show_queue(ctx):
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
+    
