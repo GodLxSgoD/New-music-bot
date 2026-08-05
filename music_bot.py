@@ -43,17 +43,14 @@ ytdl_format_options = {
     },
 }
 
-ffmpeg_options = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -b:a 192k -ar 48000",
-}
-
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
 # Prottek server-er jonno alada queue
 queues = {}
 # Prottek server-er jonno alada volume level (default 0.5 = 50%)
 volumes = {}
+# Prottek server-er jonno alada bass boost level (default 8)
+bass_levels = {}
 
 
 def get_queue(guild_id):
@@ -66,6 +63,20 @@ def get_volume(guild_id):
     if guild_id not in volumes:
         volumes[guild_id] = 0.5
     return volumes[guild_id]
+
+
+def get_bass(guild_id):
+    if guild_id not in bass_levels:
+        bass_levels[guild_id] = 8
+    return bass_levels[guild_id]
+
+
+def get_ffmpeg_options(guild_id):
+    bass = get_bass(guild_id)
+    return {
+        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        "options": f"-vn -b:a 320k -af bass=g={bass}",
+    }
 
 
 class Song:
@@ -150,7 +161,7 @@ def play_next(ctx):
         return
 
     song = queue.pop(0)
-    raw_source = discord.FFmpegPCMAudio(song.source_url, **ffmpeg_options)
+    raw_source = discord.FFmpegPCMAudio(song.source_url, **get_ffmpeg_options(guild_id))
     source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
 
     def after_play(error):
@@ -281,6 +292,21 @@ async def leave(ctx):
         await ctx.send("Voice channel theke ber hoye gelam.")
 
 
+@bot.command(name="bass")
+async def bass(ctx, level: int = None):
+    guild_id = ctx.guild.id
+    if level is None:
+        await ctx.send(f"Ekhon bass boost: **{get_bass(guild_id)}**")
+        return
+
+    if level < 0 or level > 20:
+        await ctx.send("Bass level 0 theke 20-er moddhe dao (default 8).")
+        return
+
+    bass_levels[guild_id] = level
+    await ctx.send(f"Bass boost set kora holo: **{level}** — notun gaan theke effect ashbe.")
+
+
 @bot.command(name="volume")
 async def volume(ctx, level: int = None):
     guild_id = ctx.guild.id
@@ -332,4 +358,3 @@ async def show_queue(ctx):
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
-    
