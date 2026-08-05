@@ -569,23 +569,4 @@ async def show_queue(ctx):
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
-.guild.id)
-    if not queue:
-        await ctx.send("Queue khali, shuffle korar kichu nei.")
-        return
-    random.shuffle(queue)
-    await ctx.send("Queue shuffle kora holo.")
-
-
-@bot.command(name="queue")
-async def show_queue(ctx):
-    queue = get_queue(ctx.guild.id)
-    if not queue:
-        await ctx.send("Queue khali.")
-        return
-    msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
-    await ctx.send(f"**Queue:**\n{msg}")
-
-
-if __name__ == "__main__":
-    bot.run(BOT_TOKEN)
+    
