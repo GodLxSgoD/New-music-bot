@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
-BOT_TOKEN = os.environ.get("MTUzNDY0ODgzMDU3MjYyNTk0MA.GZWMJI.NL0b4mNdOt28CQxBCxxfqVQFJhASKWvfhyz9C0")
+BOT_TOKEN = os.environ.get("MTUzNDY0ODgzMDU3MjYyNTk0MA.G8Chw2.ZUeRKqN3f0y3xd0QXAVC2mNcGaqenrPkY9dY34")
 COMMAND_PREFIX = "!"
 
 if not BOT_TOKEN:
