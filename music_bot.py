@@ -26,6 +26,11 @@ ytdl_format_options = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
 }
 
 ffmpeg_options = {
@@ -54,9 +59,11 @@ def get_volume(guild_id):
 
 
 class Song:
-    def __init__(self, source_url, title):
+    def __init__(self, source_url, title, thumbnail=None, webpage_url=None):
         self.source_url = source_url
         self.title = title
+        self.thumbnail = thumbnail
+        self.webpage_url = webpage_url
 
 
 async def search_song(query):
@@ -66,7 +73,58 @@ async def search_song(query):
     )
     if "entries" in data:
         data = data["entries"][0]
-    return Song(data["url"], data.get("title", "Unknown"))
+    return Song(
+        data["url"],
+        data.get("title", "Unknown"),
+        thumbnail=data.get("thumbnail"),
+        webpage_url=data.get("webpage_url"),
+    )
+
+
+class MusicControls(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=None)
+        self.ctx = ctx
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = self.ctx.voice_client
+        if vc and vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("Pause kora holo.", ephemeral=True)
+        elif vc and vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("Abar chalu kora holo.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = self.ctx.voice_client
+        if vc and vc.is_playing():
+            vc.stop()
+            await interaction.response.send_message("Skip kora holo.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
+
+    @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        import random
+        queue = get_queue(self.ctx.guild.id)
+        if not queue:
+            await interaction.response.send_message("Queue khali.", ephemeral=True)
+            return
+        random.shuffle(queue)
+        await interaction.response.send_message("Queue shuffle kora holo.", ephemeral=True)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        queue = get_queue(self.ctx.guild.id)
+        queue.clear()
+        vc = self.ctx.voice_client
+        if vc:
+            vc.stop()
+        await interaction.response.send_message("Stop kora holo, queue clear.", ephemeral=True)
 
 
 def play_next(ctx):
@@ -87,8 +145,18 @@ def play_next(ctx):
         play_next(ctx)
 
     voice_client.play(source, after=after_play)
+
+    embed = discord.Embed(
+        title="Now Playing",
+        description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
+        color=discord.Color.green(),
+    )
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+
+    view = MusicControls(ctx)
     asyncio.run_coroutine_threadsafe(
-        ctx.send(f"Ekhon bajche: **{song.title}**"), bot.loop
+        ctx.send(embed=embed, view=view), bot.loop
     )
 
 
@@ -128,7 +196,15 @@ async def play(ctx, *, query: str):
 
     queue = get_queue(ctx.guild.id)
     queue.append(song)
-    await ctx.send(f"Queue-te jog holo: **{song.title}**")
+
+    embed = discord.Embed(
+        title="Queue-te jog holo",
+        description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
+        color=discord.Color.blurple(),
+    )
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+    await ctx.send(embed=embed)
 
     if not ctx.voice_client.is_playing():
         play_next(ctx)
