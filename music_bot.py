@@ -51,6 +51,8 @@ queues = {}
 volumes = {}
 # Prottek server-er jonno alada bass boost level (default 8)
 bass_levels = {}
+# Prottek server-e ekhon ja bajche tar tracking: {guild_id: {"song": Song, "started_at": time.time(), "seek_offset": int}}
+now_playing = {}
 
 
 def get_queue(guild_id):
@@ -80,11 +82,12 @@ def get_ffmpeg_options(guild_id):
 
 
 class Song:
-    def __init__(self, source_url, title, thumbnail=None, webpage_url=None):
+    def __init__(self, source_url, title, thumbnail=None, webpage_url=None, duration=0):
         self.source_url = source_url
         self.title = title
         self.thumbnail = thumbnail
         self.webpage_url = webpage_url
+        self.duration = duration  # seconds
 
 
 async def search_song(query):
@@ -99,7 +102,76 @@ async def search_song(query):
         data.get("title", "Unknown"),
         thumbnail=data.get("thumbnail"),
         webpage_url=data.get("webpage_url"),
+        duration=data.get("duration", 0),
     )
+
+
+def format_time(seconds):
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def parse_time(text):
+    # "1:30" -> 90, "90" -> 90
+    parts = text.split(":")
+    parts = [int(p) for p in parts]
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
+class SeekModal(discord.ui.Modal, title="Gaan-er kono jaygay jete chao?"):
+    position = discord.ui.TextInput(
+        label="Shomoy (mm:ss ba shudhu seconds)",
+        placeholder="jemon: 1:30",
+        required=True,
+        max_length=10,
+    )
+
+    def __init__(self, ctx):
+        super().__init__()
+        self.ctx = ctx
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild_id = self.ctx.guild.id
+        info = now_playing.get(guild_id)
+        if not info or not self.ctx.voice_client:
+            await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
+            return
+        try:
+            seconds = parse_time(self.position.value)
+        except ValueError:
+            await interaction.response.send_message("Shomoy thik moto dao, jemon `1:30`.", ephemeral=True)
+            return
+
+        song = info["song"]
+        if song.duration and seconds > song.duration:
+            await interaction.response.send_message(
+                f"Gaan-er duration {format_time(song.duration)}, eto boro shomoy-e jete parba na.",
+                ephemeral=True,
+            )
+            return
+        if seconds < 0:
+            seconds = 0
+
+        info["manual_stop"] = True
+        self.ctx.voice_client.stop()
+        play_song(self.ctx, song, seek_seconds=seconds)
+        await interaction.response.send_message(f"Jump kora holo: **{format_time(seconds)}**", ephemeral=True)
+
+
+def make_progress_bar(elapsed, duration, length=20):
+    if not duration:
+        return "▬" * length
+    filled = int((elapsed / duration) * length)
+    filled = max(0, min(length, filled))
+    bar = "▬" * filled + "🔵" + "▬" * (length - filled - 1)
+    return bar
 
 
 class MusicControls(discord.ui.View):
@@ -142,14 +214,75 @@ class MusicControls(discord.ui.View):
         random.shuffle(queue)
         await interaction.response.send_message("Queue shuffle kora holo.", ephemeral=True)
 
+    @discord.ui.button(label="Seek", style=discord.ButtonStyle.secondary, emoji="🎯")
+    async def seek_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SeekModal(self.ctx))
+
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        queue = get_queue(self.ctx.guild.id)
+        guild_id = self.ctx.guild.id
+        queue = get_queue(guild_id)
         queue.clear()
+        if guild_id in now_playing:
+            now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
             vc.stop()
         await interaction.response.send_message("Stop kora holo, queue clear.", ephemeral=True)
+
+
+def get_elapsed(guild_id):
+    import time
+    info = now_playing.get(guild_id)
+    if not info:
+        return 0
+    return info["seek_offset"] + (time.time() - info["started_at"])
+
+
+def play_song(ctx, song, seek_seconds=0):
+    """Play a specific song from a specific position (seconds)."""
+    import time
+    guild_id = ctx.guild.id
+    voice_client = ctx.voice_client
+
+    opts = get_ffmpeg_options(guild_id)
+    if seek_seconds > 0:
+        opts = dict(opts)
+        opts["before_options"] = f"-ss {seek_seconds} " + opts["before_options"]
+
+    raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
+    source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
+
+    now_playing[guild_id] = {
+        "song": song,
+        "started_at": time.time(),
+        "seek_offset": seek_seconds,
+    }
+
+    def after_play(error):
+        if error:
+            print(f"Playback error: {error}")
+        # Jodi user seek/restart korche tahole eikhane notun kore queue theke pull hobe na
+        if now_playing.get(guild_id, {}).get("song") is song and not now_playing[guild_id].get("manual_stop"):
+            play_next(ctx)
+
+    voice_client.play(source, after=after_play)
+
+    embed = discord.Embed(
+        title="Now Playing",
+        description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
+        color=discord.Color.green(),
+    )
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+    if song.duration:
+        embed.add_field(name="Duration", value=format_time(song.duration))
+        embed.add_field(name="Shuru hocche", value=format_time(seek_seconds))
+
+    view = MusicControls(ctx)
+    asyncio.run_coroutine_threadsafe(
+        ctx.send(embed=embed, view=view), bot.loop
+    )
 
 
 def play_next(ctx):
@@ -161,28 +294,7 @@ def play_next(ctx):
         return
 
     song = queue.pop(0)
-    raw_source = discord.FFmpegPCMAudio(song.source_url, **get_ffmpeg_options(guild_id))
-    source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
-
-    def after_play(error):
-        if error:
-            print(f"Playback error: {error}")
-        play_next(ctx)
-
-    voice_client.play(source, after=after_play)
-
-    embed = discord.Embed(
-        title="Now Playing",
-        description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
-        color=discord.Color.green(),
-    )
-    if song.thumbnail:
-        embed.set_thumbnail(url=song.thumbnail)
-
-    view = MusicControls(ctx)
-    asyncio.run_coroutine_threadsafe(
-        ctx.send(embed=embed, view=view), bot.loop
-    )
+    play_song(ctx, song, seek_seconds=0)
 
 
 @bot.event
@@ -206,6 +318,77 @@ async def setprefix_error(ctx, error):
         await ctx.send("Eta korar jonno tomar Admin permission lagbe.")
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("Notun prefix dite hobe, jemon: `!setprefix ?`")
+
+
+@bot.command(name="seek")
+async def seek(ctx, position: str):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
+        await ctx.send("Ekhon kichu bajche na.")
+        return
+
+    try:
+        seconds = parse_time(position)
+    except ValueError:
+        await ctx.send("Shomoy thik moto dao, jemon: `mseek 1:30` ba `mseek 90`")
+        return
+
+    song = info["song"]
+    if song.duration and seconds > song.duration:
+        await ctx.send(f"Gaan-er duration {format_time(song.duration)}, eto boro shomoy-e jete parba na.")
+        return
+    if seconds < 0:
+        seconds = 0
+
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=seconds)
+
+
+@bot.command(name="restart")
+async def restart(ctx):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client:
+        await ctx.send("Ekhon kichu bajche na.")
+        return
+    song = info["song"]
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=0)
+
+
+@bot.command(name="forward")
+async def forward(ctx, seconds: int = 10):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client:
+        await ctx.send("Ekhon kichu bajche na.")
+        return
+    new_pos = int(get_elapsed(guild_id)) + seconds
+    song = info["song"]
+    if song.duration and new_pos > song.duration:
+        new_pos = song.duration
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=new_pos)
+
+
+@bot.command(name="rewind")
+async def rewind(ctx, seconds: int = 10):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client:
+        await ctx.send("Ekhon kichu bajche na.")
+        return
+    new_pos = int(get_elapsed(guild_id)) - seconds
+    if new_pos < 0:
+        new_pos = 0
+    song = info["song"]
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=new_pos)
 
 
 @bot.command(name="join")
@@ -278,8 +461,11 @@ async def resume(ctx):
 
 @bot.command(name="stop")
 async def stop(ctx):
-    queue = get_queue(ctx.guild.id)
+    guild_id = ctx.guild.id
+    queue = get_queue(guild_id)
     queue.clear()
+    if guild_id in now_playing:
+        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         ctx.voice_client.stop()
     await ctx.send("Stop kora holo, queue clear.")
@@ -287,6 +473,9 @@ async def stop(ctx):
 
 @bot.command(name="leave")
 async def leave(ctx):
+    guild_id = ctx.guild.id
+    if guild_id in now_playing:
+        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
         await ctx.send("Voice channel theke ber hoye gelam.")
@@ -329,16 +518,58 @@ async def volume(ctx, level: int = None):
 
 @bot.command(name="nowplaying")
 async def nowplaying(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        await ctx.send("Ekhon gaan bajche.")
-    else:
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await ctx.send("Ekhon kichu bajche na.")
+        return
+
+    song = info["song"]
+    elapsed = get_elapsed(guild_id)
+    if song.duration:
+        elapsed = min(elapsed, song.duration)
+    bar = make_progress_bar(elapsed, song.duration)
+
+    embed = discord.Embed(
+        title="Now Playing",
+        description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
+        color=discord.Color.green(),
+    )
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+    duration_text = format_time(song.duration) if song.duration else "?"
+    embed.add_field(
+        name="Progress",
+        value=f"{format_time(elapsed)} {bar} {duration_text}",
+        inline=False,
+    )
+    await ctx.send(embed=embed, view=MusicControls(ctx))
 
 
 @bot.command(name="shuffle")
 async def shuffle(ctx):
     import random
     queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("Queue khali, shuffle korar kichu nei.")
+        return
+    random.shuffle(queue)
+    await ctx.send("Queue shuffle kora holo.")
+
+
+@bot.command(name="queue")
+async def show_queue(ctx):
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("Queue khali.")
+        return
+    msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
+    await ctx.send(f"**Queue:**\n{msg}")
+
+
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)
+.guild.id)
     if not queue:
         await ctx.send("Queue khali, shuffle korar kichu nei.")
         return
