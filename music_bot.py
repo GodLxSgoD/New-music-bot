@@ -4,8 +4,10 @@ import discord
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
+# ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 COMMAND_PREFIX = "!"
+# -----------------------------
 
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -32,13 +34,23 @@ ffmpeg_options = {
 }
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+
+# Prottek server-er jonno alada queue
 queues = {}
+# Prottek server-er jonno alada volume level (default 0.5 = 50%)
+volumes = {}
 
 
 def get_queue(guild_id):
     if guild_id not in queues:
         queues[guild_id] = []
     return queues[guild_id]
+
+
+def get_volume(guild_id):
+    if guild_id not in volumes:
+        volumes[guild_id] = 0.5
+    return volumes[guild_id]
 
 
 class Song:
@@ -66,7 +78,8 @@ def play_next(ctx):
         return
 
     song = queue.pop(0)
-    source = discord.FFmpegPCMAudio(song.source_url, **ffmpeg_options)
+    raw_source = discord.FFmpegPCMAudio(song.source_url, **ffmpeg_options)
+    source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
 
     def after_play(error):
         if error:
@@ -158,6 +171,45 @@ async def leave(ctx):
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
         await ctx.send("Voice channel theke ber hoye gelam.")
+
+
+@bot.command(name="volume")
+async def volume(ctx, level: int = None):
+    guild_id = ctx.guild.id
+    if level is None:
+        current = int(get_volume(guild_id) * 100)
+        await ctx.send(f"Ekhon volume: **{current}%**")
+        return
+
+    if level < 0 or level > 100:
+        await ctx.send("Volume 0 theke 100-er moddhe dite hobe.")
+        return
+
+    volumes[guild_id] = level / 100
+
+    if ctx.voice_client and ctx.voice_client.source:
+        ctx.voice_client.source.volume = level / 100
+
+    await ctx.send(f"Volume set kora holo: **{level}%**")
+
+
+@bot.command(name="nowplaying")
+async def nowplaying(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        await ctx.send("Ekhon gaan bajche.")
+    else:
+        await ctx.send("Ekhon kichu bajche na.")
+
+
+@bot.command(name="shuffle")
+async def shuffle(ctx):
+    import random
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("Queue khali, shuffle korar kichu nei.")
+        return
+    random.shuffle(queue)
+    await ctx.send("Queue shuffle kora holo.")
 
 
 @bot.command(name="queue")
