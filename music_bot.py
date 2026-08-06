@@ -38,12 +38,18 @@ ytdl_format_options = {
     "source_address": "0.0.0.0",
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["android", "web", "ios", "tv"],
         }
     },
 }
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+
+# SoundCloud fallback, jokhon YouTube block kore
+sc_format_options = dict(ytdl_format_options)
+sc_format_options["default_search"] = "scsearch"
+sc_format_options.pop("extractor_args", None)
+ytdl_sc = youtube_dl.YoutubeDL(sc_format_options)
 
 # Per-server song queue
 queues = {}
@@ -93,9 +99,15 @@ class Song:
 
 async def search_song(query):
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(
-        None, lambda: ytdl.extract_info(query, download=False)
-    )
+    try:
+        data = await loop.run_in_executor(
+            None, lambda: ytdl.extract_info(query, download=False)
+        )
+    except Exception:
+        # YouTube block korle SoundCloud-e try koro
+        data = await loop.run_in_executor(
+            None, lambda: ytdl_sc.extract_info(query, download=False)
+        )
     if "entries" in data:
         data = data["entries"][0]
     return Song(
