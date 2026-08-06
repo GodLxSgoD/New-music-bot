@@ -2,35 +2,14 @@ import asyncio
 import datetime
 import os
 import re
-import random
-import time
-
 import discord
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
-try:
-    import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
-    SPOTIPY_AVAILABLE = True
-except ImportError:
-    SPOTIPY_AVAILABLE = False
-
-# ==================== CONFIG ====================
+# ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DEFAULT_PREFIX = "m"
-BOT_NAME = "TORMENTA MUSIC 2"
-
-# Optional links shown on the help menu. Leave blank to hide the button.
-SUPPORT_SERVER_URL = os.environ.get("SUPPORT_SERVER_URL", "")
-INVITE_URL = os.environ.get("INVITE_URL", "")
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
-
-# Spotify (client-credentials flow - no user login needed, just for reading
-# track/album/playlist metadata so we can find and play the matching song).
-SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
-# ==================================================
+# -----------------------------
 
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -42,6 +21,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
+# Per-server custom prefix
+prefixes = {}
+
 
 def get_prefix(bot, message):
     if message.guild is None:
@@ -52,26 +34,6 @@ def get_prefix(bot, message):
 bot = commands.Bot(command_prefix=get_prefix, intents=intents)
 bot.remove_command("help")
 
-# ---------------- Spotify client ----------------
-spotify_client = None
-if SPOTIPY_AVAILABLE and SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-    try:
-        spotify_client = spotipy.Spotify(
-            client_credentials_manager=SpotifyClientCredentials(
-                client_id=SPOTIFY_CLIENT_ID,
-                client_secret=SPOTIFY_CLIENT_SECRET,
-            )
-        )
-    except Exception as e:
-        print(f"Spotify client failed to initialize: {e}")
-        spotify_client = None
-
-SPOTIFY_URL_RE = re.compile(
-    r"open\.spotify\.com/(?:intl-\w+/)?(track|album|playlist)/([A-Za-z0-9]+)"
-)
-SPOTIFY_URI_RE = re.compile(r"spotify:(track|album|playlist):([A-Za-z0-9]+)")
-
-# ---------------- yt-dlp setup ----------------
 ytdl_format_options = {
     "format": "bestaudio[abr>0]/bestaudio/best",
     "noplaylist": True,
@@ -84,6 +46,7 @@ ytdl_format_options = {
         }
     },
 }
+
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
 # SoundCloud fallback, when YouTube blocks
@@ -92,29 +55,41 @@ sc_format_options["default_search"] = "scsearch"
 sc_format_options.pop("extractor_args", None)
 ytdl_sc = youtube_dl.YoutubeDL(sc_format_options)
 
-# Used for Autoplay: fetches a YouTube "Mix"/radio playlist based on the
-# last played video
+# Used for Autoplay: fetches a YouTube "Mix"/radio playlist based on the last played video
 radio_format_options = dict(ytdl_format_options)
 radio_format_options["noplaylist"] = False
 radio_format_options["playlistend"] = 5
 ytdl_radio = youtube_dl.YoutubeDL(radio_format_options)
 
-# ---------------- Per-server state ----------------
-prefixes = {}
+# Per-server song queue
 queues = {}
+# Per-server volume level (default 0.5 = 50%)
 volumes = {}
+# Per-server bass boost level (default 3)
 bass_levels = {}
+# Tracks what's currently playing per server
 now_playing = {}
+# Per-server play history (for Previous button)
 history = {}
+# Per-server loop mode: "off", "one", "queue"
 loop_modes = {}
+# Per-server autoplay toggle: True/False
 autoplay_flags = {}
+# Per-channel sticky message: {channel_id: {"content": str, "message": discord.Message}}
 sticky_messages = {}
+# Per-guild logs channel id
 logs_channels = {}
+# Tracks when each user joined a voice channel: {(guild_id, user_id): datetime}
 voice_join_times = {}
+# Per-guild DJ role id (None = no restriction)
 dj_roles = {}
+# Per-guild 24/7 mode toggle
 stay_247 = {}
+# Per-guild allowed bot-command channels (empty set = allowed everywhere)
 bot_channels = {}
+# Per-guild command aliases: {alias: real_command_name}
 command_aliases = {}
+# Per-guild active vote-skip votes: {guild_id: set(user_id)}
 voteskip_votes = {}
 
 
@@ -162,8 +137,7 @@ def get_autoplay(guild_id):
 
 
 class Song:
-    def __init__(self, source_url, title, thumbnail=None, webpage_url=None,
-                 duration=0, source_name="YouTube"):
+    def __init__(self, source_url, title, thumbnail=None, webpage_url=None, duration=0, source_name="YouTube"):
         self.source_url = source_url
         self.title = title
         self.thumbnail = thumbnail
@@ -197,9 +171,8 @@ async def search_song(query):
 
 
 def fetch_autoplay_song(last_song):
-    """Blocking call (safe to run on a background thread) that finds a
-    related YouTube song to the last one played, using YouTube's Mix/Radio
-    playlist."""
+    """Blocking call (safe to run on a background thread) that finds a related
+    YouTube song to the last one played, using YouTube's Mix/Radio playlist."""
     if not last_song.webpage_url or "watch?v=" not in last_song.webpage_url:
         return None
     match = re.search(r"watch\?v=([\w-]+)", last_song.webpage_url)
@@ -211,6 +184,7 @@ def fetch_autoplay_song(last_song):
         data = ytdl_radio.extract_info(radio_url, download=False)
     except Exception:
         return None
+
     entries = data.get("entries") or []
     for entry in entries:
         if not entry:
@@ -229,63 +203,6 @@ def fetch_autoplay_song(last_song):
             duration=full.get("duration", 0),
             source_name="YouTube (Autoplay)",
         )
-    return None
-
-
-# ---------------- Spotify helpers ----------------
-def spotify_track_to_query(track):
-    if not track:
-        return None
-    artists = ", ".join(a["name"] for a in track.get("artists", []))
-    return f"{track.get('name', '')} {artists}".strip()
-
-
-async def resolve_spotify(query):
-    """If `query` is a Spotify track/album/playlist link, return a list of
-    plain-text search strings (song + artist) to look up on YouTube.
-    Returns None if it's not a Spotify link at all."""
-    match = SPOTIFY_URL_RE.search(query) or SPOTIFY_URI_RE.search(query)
-    if not match:
-        return None
-    if not spotify_client:
-        raise RuntimeError(
-            "Spotify links aren't set up yet. Ask the bot owner to add "
-            "SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."
-        )
-    kind, spotify_id = match.groups()
-    loop = asyncio.get_event_loop()
-    if kind == "track":
-        track = await loop.run_in_executor(None, lambda: spotify_client.track(spotify_id))
-        q = spotify_track_to_query(track)
-        return [q] if q else []
-    if kind == "album":
-        album = await loop.run_in_executor(None, lambda: spotify_client.album_tracks(spotify_id))
-        results = []
-        for t in album.get("items", []):
-            artists = ", ".join(a["name"] for a in t.get("artists", []))
-            q = f"{t.get('name', '')} {artists}".strip()
-            if q:
-                results.append(q)
-        return results
-    if kind == "playlist":
-        results = []
-        offset = 0
-        while True:
-            page = await loop.run_in_executor(
-                None, lambda o=offset: spotify_client.playlist_items(spotify_id, offset=o, limit=100)
-            )
-            items = page.get("items", [])
-            if not items:
-                break
-            for item in items:
-                q = spotify_track_to_query(item.get("track"))
-                if q:
-                    results.append(q)
-            if page.get("next"):
-                offset += 100
-            else:
-                break
-        return results
     return None
 
 
@@ -330,6 +247,7 @@ class SeekModal(discord.ui.Modal, title="Jump to a position in the song"):
         except ValueError:
             await interaction.response.send_message("Please enter a valid time, e.g. `1:30`.", ephemeral=True)
             return
+
         song = info["song"]
         if song.duration and seconds > song.duration:
             await interaction.response.send_message(
@@ -339,6 +257,7 @@ class SeekModal(discord.ui.Modal, title="Jump to a position in the song"):
             return
         if seconds < 0:
             seconds = 0
+
         info["manual_stop"] = True
         self.ctx.voice_client.stop()
         play_song(self.ctx, song, seek_seconds=seconds)
@@ -404,6 +323,7 @@ class MusicControls(discord.ui.View):
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, row=1)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        import random
         queue = get_queue(self.ctx.guild.id)
         if not queue:
             await interaction.response.send_message("The queue is empty.", ephemeral=True)
@@ -460,6 +380,7 @@ class MusicControls(discord.ui.View):
 
 
 def get_elapsed(guild_id):
+    import time
     info = now_playing.get(guild_id)
     if not info:
         return 0
@@ -474,28 +395,33 @@ def build_now_playing_embed(guild_id, song, elapsed=0):
     )
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
+
     duration_text = format_time(song.duration) if song.duration else "?"
     bar = make_progress_bar(elapsed, song.duration)
     embed.add_field(name="Progress", value=f"{format_time(elapsed)} {bar} {duration_text}", inline=False)
+
     queue_count = len(get_queue(guild_id))
     volume_pct = int(get_volume(guild_id) * 100)
     loop_mode = get_loop(guild_id)
+
     embed.add_field(name="Queue", value=str(queue_count), inline=True)
     embed.add_field(name="Volume", value=f"{volume_pct}%", inline=True)
     embed.add_field(name="Loop", value=loop_mode, inline=True)
     embed.add_field(name="Source", value=song.source_name, inline=True)
-    embed.set_footer(text=BOT_NAME)
     return embed
 
 
 def play_song(ctx, song, seek_seconds=0):
     """Play a specific song from a specific position (seconds)."""
+    import time
     guild_id = ctx.guild.id
     voice_client = ctx.voice_client
+
     opts = get_ffmpeg_options(guild_id)
     if seek_seconds > 0:
         opts = dict(opts)
         opts["before_options"] = f"-ss {seek_seconds} " + opts["before_options"]
+
     raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
     source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
 
@@ -516,18 +442,22 @@ def play_song(ctx, song, seek_seconds=0):
                 return
             if mode == "queue":
                 get_queue(guild_id).append(song)
-        get_history(guild_id).append(song)
-        if not get_queue(guild_id) and get_autoplay(guild_id):
-            next_song = fetch_autoplay_song(song)
-            if next_song:
-                play_song(ctx, next_song, seek_seconds=0)
-                return
-        play_next(ctx)
+            get_history(guild_id).append(song)
+
+            if not get_queue(guild_id) and get_autoplay(guild_id):
+                next_song = fetch_autoplay_song(song)
+                if next_song:
+                    play_song(ctx, next_song, seek_seconds=0)
+                    return
+            play_next(ctx)
 
     voice_client.play(source, after=after_play)
+
     embed = build_now_playing_embed(guild_id, song, elapsed=seek_seconds)
     view = MusicControls(ctx)
-    asyncio.run_coroutine_threadsafe(ctx.send(embed=embed, view=view), bot.loop)
+    asyncio.run_coroutine_threadsafe(
+        ctx.send(embed=embed, view=view), bot.loop
+    )
     asyncio.run_coroutine_threadsafe(
         send_log(ctx.guild, f"🎵 **{ctx.author}** is now playing **{song.title}** in **{voice_client.channel.name}**"),
         bot.loop,
@@ -538,24 +468,17 @@ def play_next(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
     voice_client = ctx.voice_client
+
     if not queue or voice_client is None:
         return
+
     song = queue.pop(0)
     play_song(ctx, song, seek_seconds=0)
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} — {BOT_NAME}")
-    try:
-        await bot.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.listening,
-                name=f"{DEFAULT_PREFIX}help | {BOT_NAME}",
-            )
-        )
-    except Exception:
-        pass
+    print(f"Logged in as {bot.user}")
 
 
 @bot.event
@@ -623,24 +546,129 @@ async def send_log(guild, description, color=discord.Color.blurple()):
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
+
     guild = member.guild
     key = (guild.id, member.id)
 
+    # User joined a voice channel
     if before.channel is None and after.channel is not None:
         voice_join_times[key] = datetime.datetime.utcnow()
-        await send_log(guild, f"🔊 **{member}** joined voice channel **{after.channel.name}**", color=discord.Color.green())
+        await send_log(
+            guild,
+            f"🔊 **{member}** joined voice channel **{after.channel.name}**",
+            color=discord.Color.green(),
+        )
+
+    # User left a voice channel entirely
     elif before.channel is not None and after.channel is None:
         joined_at = voice_join_times.pop(key, None)
         duration_text = ""
         if joined_at:
             seconds = (datetime.datetime.utcnow() - joined_at).total_seconds()
             duration_text = f" (stayed {format_time(seconds)})"
-        await send_log(guild, f"🔇 **{member}** left voice channel **{before.channel.name}**{duration_text}", color=discord.Color.red())
+        await send_log(
+            guild,
+            f"🔇 **{member}** left voice channel **{before.channel.name}**{duration_text}",
+            color=discord.Color.red(),
+        )
+
+    # User switched voice channels
     elif before.channel is not None and after.channel is not None and before.channel != after.channel:
-        await send_log(guild, f"🔀 **{member}** moved from **{before.channel.name}** to **{after.channel.name}**", color=discord.Color.gold())
+        await send_log(
+            guild,
+            f"🔀 **{member}** moved from **{before.channel.name}** to **{after.channel.name}**",
+            color=discord.Color.gold(),
+        )
 
 
-# ==================== PLAYBACK COMMANDS ====================
+@bot.command(name="setprefix")
+@commands.has_permissions(administrator=True)
+async def setprefix(ctx, new_prefix: str):
+    if len(new_prefix) > 5:
+        await ctx.send("That prefix is too long, please use something shorter (max 5 characters).")
+        return
+    prefixes[ctx.guild.id] = new_prefix
+    await ctx.send(f"Prefix changed to: **{new_prefix}**")
+
+
+@setprefix.error
+async def setprefix_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need Administrator permission to do that.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Please provide a new prefix, e.g. `msetprefix ?`")
+
+
+@bot.command(name="seek")
+async def seek(ctx, position: str):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
+        await ctx.send("Nothing is playing right now.")
+        return
+
+    try:
+        seconds = parse_time(position)
+    except ValueError:
+        await ctx.send("Please enter a valid time, e.g.: `mseek 1:30` or `mseek 90`")
+        return
+
+    song = info["song"]
+    if song.duration and seconds > song.duration:
+        await ctx.send(f"The song is only {format_time(song.duration)} long, you can't seek past that.")
+        return
+    if seconds < 0:
+        seconds = 0
+
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=seconds)
+
+
+@bot.command(name="restart")
+async def restart(ctx):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client:
+        await ctx.send("Nothing is playing right now.")
+        return
+    song = info["song"]
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=0)
+
+
+@bot.command(name="forward")
+async def forward(ctx, seconds: int = 10):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client:
+        await ctx.send("Nothing is playing right now.")
+        return
+    new_pos = int(get_elapsed(guild_id)) + seconds
+    song = info["song"]
+    if song.duration and new_pos > song.duration:
+        new_pos = song.duration
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=new_pos)
+
+
+@bot.command(name="rewind")
+async def rewind(ctx, seconds: int = 10):
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+    if not info or not ctx.voice_client:
+        await ctx.send("Nothing is playing right now.")
+        return
+    new_pos = int(get_elapsed(guild_id)) - seconds
+    if new_pos < 0:
+        new_pos = 0
+    song = info["song"]
+    info["manual_stop"] = True
+    ctx.voice_client.stop()
+    play_song(ctx, song, seek_seconds=new_pos)
+
 
 @bot.command(name="join")
 async def join(ctx):
@@ -656,43 +684,14 @@ async def join(ctx):
     await send_log(ctx.guild, f"🤖 Bot joined **{channel.name}** (requested by {ctx.author})", color=discord.Color.blue())
 
 
-@bot.command(name="play", aliases=["p"])
+@bot.command(name="play")
 async def play(ctx, *, query: str):
     if ctx.author.voice is None:
         await ctx.send("You need to join a voice channel first.")
         return
+
     if ctx.voice_client is None:
         await ctx.author.voice.channel.connect()
-
-    # Spotify link? Resolve to plain search text(s), then find on YouTube.
-    try:
-        spotify_queries = await resolve_spotify(query)
-    except RuntimeError as e:
-        await ctx.send(f"⚠️ {e}")
-        return
-
-    if spotify_queries is not None:
-        if not spotify_queries:
-            await ctx.send("Couldn't read any tracks from that Spotify link.")
-            return
-        status = await ctx.send(f"🟢 Found **{len(spotify_queries)}** track(s) on Spotify — matching them on YouTube...")
-        queue = get_queue(ctx.guild.id)
-        added = 0
-        for q in spotify_queries:
-            try:
-                song = await search_song(q)
-            except Exception:
-                continue
-            song.source_name = "Spotify"
-            queue.append(song)
-            added += 1
-        if added == 0:
-            await status.edit(content="Couldn't find any of those tracks on YouTube.")
-            return
-        await status.edit(content=f"✅ Added **{added}** track(s) from Spotify to the queue.")
-        if not ctx.voice_client.is_playing():
-            play_next(ctx)
-        return
 
     await ctx.send(f"Searching: **{query}** ...")
     try:
@@ -703,6 +702,7 @@ async def play(ctx, *, query: str):
 
     queue = get_queue(ctx.guild.id)
     queue.append(song)
+
     embed = discord.Embed(
         title="Added to Queue",
         description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
@@ -730,8 +730,6 @@ async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send("Paused.")
-    else:
-        await ctx.send("Nothing is playing right now.")
 
 
 @bot.command(name="resume")
@@ -739,8 +737,6 @@ async def resume(ctx):
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send("Resumed.")
-    else:
-        await ctx.send("Nothing is paused right now.")
 
 
 @bot.command(name="stop")
@@ -755,7 +751,7 @@ async def stop(ctx):
     await ctx.send("Stopped and cleared the queue.")
 
 
-@bot.command(name="leave", aliases=["disconnect"])
+@bot.command(name="leave")
 async def leave(ctx):
     guild_id = ctx.guild.id
     if guild_id in now_playing:
@@ -765,118 +761,58 @@ async def leave(ctx):
         await ctx.voice_client.disconnect()
         await ctx.send("Left the voice channel.")
         await send_log(ctx.guild, f"🤖 Bot left **{channel_name}** (requested by {ctx.author})", color=discord.Color.blue())
-    else:
-        await ctx.send("I'm not in a voice channel.")
 
 
-@bot.command(name="restart")
-async def restart(ctx):
+@bot.command(name="bass")
+async def bass(ctx, level: int = None):
     guild_id = ctx.guild.id
-    info = now_playing.get(guild_id)
-    if not info or not ctx.voice_client:
-        await ctx.send("Nothing is playing right now.")
+    if level is None:
+        await ctx.send(f"Current bass boost: **{get_bass(guild_id)}**")
         return
-    song = info["song"]
-    info["manual_stop"] = True
-    ctx.voice_client.stop()
-    play_song(ctx, song, seek_seconds=0)
+
+    if level < 0 or level > 20:
+        await ctx.send("Bass level must be between 0 and 20 (default 3).")
+        return
+
+    bass_levels[guild_id] = level
+    await ctx.send(f"Bass boost set to: **{level}** — this will apply from the next song.")
 
 
-@bot.command(name="previous")
-async def previous(ctx):
+@bot.command(name="volume")
+async def volume(ctx, level: int = None):
     guild_id = ctx.guild.id
-    hist = get_history(guild_id)
-    if not hist:
-        await ctx.send("No previous song.")
+    if level is None:
+        current = int(get_volume(guild_id) * 100)
+        await ctx.send(f"Current volume: **{current}%**")
         return
-    prev_song = hist.pop()
-    current = now_playing.get(guild_id)
-    if current:
-        get_queue(guild_id).insert(0, current["song"])
-        now_playing[guild_id]["manual_stop"] = True
-    if ctx.voice_client:
-        ctx.voice_client.stop()
-    play_song(ctx, prev_song, seek_seconds=0)
+
+    if level < 0 or level > 100:
+        await ctx.send("Volume must be between 0 and 100.")
+        return
+
+    volumes[guild_id] = level / 100
+
+    if ctx.voice_client and ctx.voice_client.source:
+        ctx.voice_client.source.volume = level / 100
+
+    await ctx.send(f"Volume set to: **{level}%**")
 
 
-# ==================== NAVIGATION COMMANDS ====================
-
-@bot.command(name="seek")
-async def seek(ctx, position: str):
+@bot.command(name="nowplaying")
+async def nowplaying(ctx):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
     if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await ctx.send("Nothing is playing right now.")
         return
-    try:
-        seconds = parse_time(position)
-    except ValueError:
-        await ctx.send("Please enter a valid time, e.g.: `mseek 1:30` or `mseek 90`")
-        return
+
     song = info["song"]
-    if song.duration and seconds > song.duration:
-        await ctx.send(f"The song is only {format_time(song.duration)} long, you can't seek past that.")
-        return
-    if seconds < 0:
-        seconds = 0
-    info["manual_stop"] = True
-    ctx.voice_client.stop()
-    play_song(ctx, song, seek_seconds=seconds)
+    elapsed = get_elapsed(guild_id)
+    if song.duration:
+        elapsed = min(elapsed, song.duration)
 
-
-@bot.command(name="forward", aliases=["ff"])
-async def forward(ctx, seconds: int = 10):
-    guild_id = ctx.guild.id
-    info = now_playing.get(guild_id)
-    if not info or not ctx.voice_client:
-        await ctx.send("Nothing is playing right now.")
-        return
-    new_pos = int(get_elapsed(guild_id)) + seconds
-    song = info["song"]
-    if song.duration and new_pos > song.duration:
-        new_pos = song.duration
-    info["manual_stop"] = True
-    ctx.voice_client.stop()
-    play_song(ctx, song, seek_seconds=new_pos)
-
-
-@bot.command(name="rewind", aliases=["rw"])
-async def rewind(ctx, seconds: int = 10):
-    guild_id = ctx.guild.id
-    info = now_playing.get(guild_id)
-    if not info or not ctx.voice_client:
-        await ctx.send("Nothing is playing right now.")
-        return
-    new_pos = int(get_elapsed(guild_id)) - seconds
-    if new_pos < 0:
-        new_pos = 0
-    song = info["song"]
-    info["manual_stop"] = True
-    ctx.voice_client.stop()
-    play_song(ctx, song, seek_seconds=new_pos)
-
-
-# ==================== QUEUE COMMANDS ====================
-
-@bot.command(name="queue", aliases=["q"])
-async def show_queue(ctx):
-    queue = get_queue(ctx.guild.id)
-    if not queue:
-        await ctx.send("The queue is empty.")
-        return
-    msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue[:25]))
-    extra = f"\n...and {len(queue) - 25} more" if len(queue) > 25 else ""
-    await ctx.send(f"**Queue:**\n{msg}{extra}")
-
-
-@bot.command(name="shuffle")
-async def shuffle(ctx):
-    queue = get_queue(ctx.guild.id)
-    if not queue:
-        await ctx.send("The queue is empty, nothing to shuffle.")
-        return
-    random.shuffle(queue)
-    await ctx.send("Queue shuffled.")
+    embed = build_now_playing_embed(guild_id, song, elapsed=elapsed)
+    await ctx.send(embed=embed, view=MusicControls(ctx))
 
 
 @bot.command(name="loop")
@@ -908,197 +844,45 @@ async def autoplay(ctx, mode: str = None):
     await ctx.send(f"Autoplay turned **{mode}**.")
 
 
-# ==================== AUDIO COMMANDS ====================
-
-@bot.command(name="volume", aliases=["vol"])
-async def volume(ctx, level: int = None):
+@bot.command(name="previous")
+async def previous(ctx):
     guild_id = ctx.guild.id
-    if level is None:
-        current = int(get_volume(guild_id) * 100)
-        await ctx.send(f"Current volume: **{current}%**")
+    hist = get_history(guild_id)
+    if not hist:
+        await ctx.send("No previous song.")
         return
-    if level < 0 or level > 100:
-        await ctx.send("Volume must be between 0 and 100.")
+    prev_song = hist.pop()
+    current = now_playing.get(guild_id)
+    if current:
+        get_queue(guild_id).insert(0, current["song"])
+        now_playing[guild_id]["manual_stop"] = True
+    if ctx.voice_client:
+        ctx.voice_client.stop()
+    play_song(ctx, prev_song, seek_seconds=0)
+
+
+@bot.command(name="shuffle")
+async def shuffle(ctx):
+    import random
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The queue is empty, nothing to shuffle.")
         return
-    volumes[guild_id] = level / 100
-    if ctx.voice_client and ctx.voice_client.source:
-        ctx.voice_client.source.volume = level / 100
-    await ctx.send(f"Volume set to: **{level}%**")
+    random.shuffle(queue)
+    await ctx.send("Queue shuffled.")
 
 
-@bot.command(name="bass")
-async def bass(ctx, level: int = None):
-    guild_id = ctx.guild.id
-    if level is None:
-        await ctx.send(f"Current bass boost: **{get_bass(guild_id)}**")
+@bot.command(name="queue")
+async def show_queue(ctx):
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The queue is empty.")
         return
-    if level < 0 or level > 20:
-        await ctx.send("Bass level must be between 0 and 20 (default 3).")
-        return
-    bass_levels[guild_id] = level
-    await ctx.send(f"Bass boost set to: **{level}** — this will apply from the next song.")
+    msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
+    await ctx.send(f"**Queue:**\n{msg}")
 
 
-@bot.command(name="nowplaying", aliases=["np"])
-async def nowplaying(ctx):
-    guild_id = ctx.guild.id
-    info = now_playing.get(guild_id)
-    if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
-        await ctx.send("Nothing is playing right now.")
-        return
-    song = info["song"]
-    elapsed = get_elapsed(guild_id)
-    if song.duration:
-        elapsed = min(elapsed, song.duration)
-    embed = build_now_playing_embed(guild_id, song, elapsed=elapsed)
-    await ctx.send(embed=embed, view=MusicControls(ctx))
-
-
-# ==================== SPOTIFY ====================
-
-@bot.command(name="spotifystatus")
-async def spotifystatus(ctx):
-    if spotify_client:
-        await ctx.send("🟢 Spotify is connected. Paste a track/album/playlist link into `mplay` to use it.")
-    else:
-        await ctx.send(
-            "🔴 Spotify isn't connected. The bot owner needs to set "
-            "`SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`."
-        )
-
-
-# ==================== UTILITY ====================
-
-@bot.command(name="ping")
-async def ping(ctx):
-    latency_ms = round(bot.latency * 1000)
-    await ctx.send(f"🏓 Pong! Latency: **{latency_ms}ms**")
-
-
-@bot.command(name="voteskip", aliases=["vs"])
-async def voteskip(ctx):
-    guild_id = ctx.guild.id
-    vc = ctx.voice_client
-    if not vc or not vc.is_playing():
-        await ctx.send("Nothing is playing right now.")
-        return
-    if ctx.author.voice is None or ctx.author.voice.channel != vc.channel:
-        await ctx.send("You need to be in the same voice channel to vote.")
-        return
-    votes = voteskip_votes.setdefault(guild_id, set())
-    votes.add(ctx.author.id)
-    members_in_vc = [m for m in vc.channel.members if not m.bot]
-    needed = max(1, len(members_in_vc) // 2 + 1)
-    if len(votes) >= needed:
-        vc.stop()
-        votes.clear()
-        await ctx.send("✅ Vote passed — skipping!")
-    else:
-        await ctx.send(f"🗳 Vote to skip: {len(votes)}/{needed}")
-
-
-@bot.command(name="sticky")
-@commands.has_permissions(manage_messages=True)
-async def sticky(ctx, *, content: str):
-    channel_id = ctx.channel.id
-    old = sticky_messages.get(channel_id)
-    if old and old.get("message"):
-        try:
-            await old["message"].delete()
-        except Exception:
-            pass
-    msg = await ctx.send(f"📌 {content}")
-    sticky_messages[channel_id] = {"content": content, "message": msg}
-
-
-@bot.command(name="stickyoff")
-@commands.has_permissions(manage_messages=True)
-async def stickyoff(ctx):
-    channel_id = ctx.channel.id
-    old = sticky_messages.pop(channel_id, None)
-    if old and old.get("message"):
-        try:
-            await old["message"].delete()
-        except Exception:
-            pass
-    await ctx.send("Sticky message removed.")
-
-
-# ==================== MODERATION ====================
-
-@bot.command(name="ban")
-@commands.has_permissions(ban_members=True)
-async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
-    await member.ban(reason=reason)
-    await ctx.send(f"🔨 Banned **{member}**. Reason: {reason}")
-
-
-@bot.command(name="unban")
-@commands.has_permissions(ban_members=True)
-async def unban(ctx, *, user: str):
-    banned = [entry async for entry in ctx.guild.bans()]
-    target = None
-    if user.isdigit():
-        target = discord.utils.find(lambda b: b.user.id == int(user), banned)
-    else:
-        target = discord.utils.find(lambda b: str(b.user) == user or b.user.name == user, banned)
-    if target is None:
-        await ctx.send("Couldn't find that user in the ban list.")
-        return
-    await ctx.guild.unban(target.user)
-    await ctx.send(f"✅ Unbanned **{target.user}**.")
-
-
-@bot.command(name="kick")
-@commands.has_permissions(kick_members=True)
-async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
-    await member.kick(reason=reason)
-    await ctx.send(f"👢 Kicked **{member}**. Reason: {reason}")
-
-
-@bot.command(name="timeout")
-@commands.has_permissions(moderate_members=True)
-async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason provided"):
-    duration = datetime.timedelta(minutes=minutes)
-    await member.timeout(duration, reason=reason)
-    await ctx.send(f"🔇 Timed out **{member}** for **{minutes} minute(s)**. Reason: {reason}")
-
-
-@bot.command(name="untimeout")
-@commands.has_permissions(moderate_members=True)
-async def untimeout(ctx, member: discord.Member):
-    await member.timeout(None)
-    await ctx.send(f"🔊 Removed timeout from **{member}**.")
-
-
-@bot.command(name="clear", aliases=["purge"])
-@commands.has_permissions(manage_messages=True)
-async def clear(ctx, amount: int = 5):
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
-    await asyncio.sleep(3)
-    await msg.delete()
-
-
-# ==================== ADMIN & CONFIG ====================
-
-@bot.command(name="setprefix")
-@commands.has_permissions(administrator=True)
-async def setprefix(ctx, new_prefix: str):
-    if len(new_prefix) > 5:
-        await ctx.send("That prefix is too long, please use something shorter (max 5 characters).")
-        return
-    prefixes[ctx.guild.id] = new_prefix
-    await ctx.send(f"Prefix changed to: **{new_prefix}**")
-
-
-@setprefix.error
-async def setprefix_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You need Administrator permission to do that.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Please provide a new prefix, e.g. `msetprefix ?`")
-
+# ---------- LOGS & ADMIN CONFIG ----------
 
 @bot.command(name="setuplogs")
 @commands.has_permissions(manage_guild=True)
@@ -1167,6 +951,7 @@ async def stay_in_vc(ctx, mode: str = None):
 async def botchannel(ctx, action: str = None, channel: discord.TextChannel = None):
     guild_id = ctx.guild.id
     allowed = bot_channels.setdefault(guild_id, set())
+
     if action is None or action == "list":
         if not allowed:
             await ctx.send("No restricted channels set — commands work everywhere.")
@@ -1174,6 +959,7 @@ async def botchannel(ctx, action: str = None, channel: discord.TextChannel = Non
             mentions = ", ".join(f"<#{cid}>" for cid in allowed)
             await ctx.send(f"Bot commands are restricted to: {mentions}")
         return
+
     if action == "add":
         if channel is None:
             await ctx.send("Usage: `mbotchannel add #channel`")
@@ -1255,7 +1041,7 @@ async def settings_view(ctx):
     dj_role_obj = ctx.guild.get_role(dj_roles.get(guild_id)) if dj_roles.get(guild_id) else None
     logs_channel_obj = ctx.guild.get_channel(logs_channels.get(guild_id)) if logs_channels.get(guild_id) else None
 
-    embed = discord.Embed(title=f"⚙️ {BOT_NAME} — Server Settings", color=discord.Color.blurple())
+    embed = discord.Embed(title="⚙️ Server Settings", color=discord.Color.blurple())
     embed.add_field(name="Prefix", value=f"`{prefix}`", inline=True)
     embed.add_field(name="Volume", value=f"{int(get_volume(guild_id) * 100)}%", inline=True)
     embed.add_field(name="Bass Boost", value=str(get_bass(guild_id)), inline=True)
@@ -1264,7 +1050,6 @@ async def settings_view(ctx):
     embed.add_field(name="24/7 Mode", value="on" if stay_247.get(guild_id) else "off", inline=True)
     embed.add_field(name="DJ Role", value=dj_role_obj.mention if dj_role_obj else "None", inline=True)
     embed.add_field(name="Logs Channel", value=logs_channel_obj.mention if logs_channel_obj else "None", inline=True)
-    embed.add_field(name="Spotify", value="🟢 Connected" if spotify_client else "🔴 Not configured", inline=True)
     allowed = bot_channels.get(guild_id)
     embed.add_field(
         name="Bot Channels",
@@ -1292,6 +1077,28 @@ async def settings_autoplay(ctx, mode: str):
     await autoplay(ctx, mode)
 
 
+@bot.command(name="voteskip")
+async def voteskip(ctx):
+    guild_id = ctx.guild.id
+    vc = ctx.voice_client
+    if not vc or not vc.is_playing():
+        await ctx.send("Nothing is playing right now.")
+        return
+    if ctx.author.voice is None or ctx.author.voice.channel != vc.channel:
+        await ctx.send("You need to be in the same voice channel to vote.")
+        return
+    votes = voteskip_votes.setdefault(guild_id, set())
+    votes.add(ctx.author.id)
+    members_in_vc = [m for m in vc.channel.members if not m.bot]
+    needed = max(1, len(members_in_vc) // 2 + 1)
+    if len(votes) >= needed:
+        vc.stop()
+        votes.clear()
+        await ctx.send("✅ Vote passed — skipping!")
+    else:
+        await ctx.send(f"🗳️ Vote to skip: {len(votes)}/{needed}")
+
+
 MUSIC_COMMANDS = {
     "play", "skip", "pause", "resume", "stop", "queue", "shuffle", "volume",
     "bass", "loop", "autoplay", "seek", "forward", "rewind", "restart",
@@ -1313,222 +1120,196 @@ async def global_music_check(ctx):
     return True
 
 
-# ==================== HELP MENU ====================
-
-HELP_CATEGORIES = {
-    "playback": {
-        "label": "Playback",
-        "emoji": "🎵",
-        "description": "Play, pause, skip and queue songs",
-        "title": "🎵 Playback Commands",
-        "lines": [
-            "`{p}play <song or Spotify link>` — Search & play/queue a song",
-            "`{p}pause` / `{p}resume` — Pause or resume",
-            "`{p}skip` — Skip current song",
-            "`{p}previous` — Go back to the last song",
-            "`{p}stop` — Stop and clear queue",
-            "`{p}restart` — Restart current song",
-        ],
-    },
-    "navigation": {
-        "label": "Navigation",
-        "emoji": "🎯",
-        "description": "Jump around inside a song",
-        "title": "🎯 Navigation Commands",
-        "lines": [
-            "`{p}seek <mm:ss>` — Jump to a position",
-            "`{p}forward [secs]` — Skip forward (default 10s)",
-            "`{p}rewind [secs]` — Skip backward (default 10s)",
-        ],
-    },
-    "queue": {
-        "label": "Queue",
-        "emoji": "📜",
-        "description": "Manage the up-next queue",
-        "title": "📜 Queue Commands",
-        "lines": [
-            "`{p}queue` — Show the current queue",
-            "`{p}shuffle` — Shuffle the queue",
-            "`{p}loop [off/one/queue]` — Set loop mode",
-            "`{p}autoplay [on/off]` — Auto-continue with related songs",
-        ],
-    },
-    "audio": {
-        "label": "Audio",
-        "emoji": "🔊",
-        "description": "Volume and bass boost",
-        "title": "🔊 Audio Commands",
-        "lines": [
-            "`{p}volume [0-100]` — View/set volume",
-            "`{p}bass [0-20]` — View/set bass boost",
-        ],
-    },
-    "spotify": {
-        "label": "Spotify",
-        "emoji": "🟢",
-        "description": "Play tracks, albums & playlists from Spotify",
-        "title": "🟢 Spotify Integration",
-        "lines": [
-            "`{p}play <spotify track/album/playlist link>` — Queue songs straight from Spotify",
-            "`{p}spotifystatus` — Check whether Spotify is connected",
-            "_Tip: paste any `open.spotify.com` link into `{p}play` — the bot finds a matching version to stream._",
-        ],
-    },
-    "voice": {
-        "label": "Voice & Settings",
-        "emoji": "⚙️",
-        "description": "Join/leave voice, prefix, server settings",
-        "title": "⚙️ Voice & Settings Commands",
-        "lines": [
-            "`{p}join` — Join your voice channel",
-            "`{p}leave` — Leave voice channel",
-            "`{p}nowplaying` — Show current song details",
-            "`{p}setprefix <new>` — Change prefix (Admin only)",
-            "`{p}settings view` — Show all current server settings",
-        ],
-    },
-    "moderation": {
-        "label": "Moderation",
-        "emoji": "🛡",
-        "description": "Ban, kick, timeout & message cleanup",
-        "title": "🛡 Moderation Commands",
-        "lines": [
-            "`{p}ban @user [reason]` — Ban a member",
-            "`{p}unban <username or ID>` — Unban a member",
-            "`{p}kick @user [reason]` — Kick a member",
-            "`{p}timeout @user <minutes> [reason]` — Timeout a member",
-            "`{p}untimeout @user` — Remove a timeout",
-            "`{p}clear <amount>` — Delete recent messages",
-            "`{p}sticky <message>` — Pin a repeating sticky message",
-            "`{p}stickyoff` — Remove the sticky message",
-        ],
-    },
-    "utility": {
-        "label": "Utility",
-        "emoji": "🛠",
-        "description": "Ping and vote-skip",
-        "title": "🛠 Utility Commands",
-        "lines": [
-            "`{p}ping` — Check bot latency",
-            "`{p}voteskip` — Vote to skip the current song",
-        ],
-    },
-    "admin": {
-        "label": "Admin & Config",
-        "emoji": "🔧",
-        "description": "Logs, DJ role, 24/7, aliases & more",
-        "title": "🔧 Admin & Config Commands",
-        "lines": [
-            "`{p}setuplogs [#channel]` — Set the voice-activity/logs channel",
-            "`{p}removelogs` — Disable logging",
-            "`{p}dj role <@role>` — Restrict music commands to a DJ role",
-            "`{p}247 on/off` — Stay in voice channel 24/7",
-            "`{p}botchannel add/remove/list/clear [#channel]` — Restrict commands to channels",
-            "`{p}aliases set/remove/list/clear <alias> <command>` — Custom command aliases",
-        ],
-    },
-}
-
-HELP_CATEGORY_ORDER = [
-    "playback", "navigation", "queue", "audio", "spotify",
-    "voice", "moderation", "utility", "admin",
-]
+@bot.command(name="ping")
+async def ping(ctx):
+    latency_ms = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Latency: **{latency_ms}ms**")
 
 
-def build_overview_embed(prefix):
-    embed = discord.Embed(
-        title=f"Welcome! Let's Get Started with {BOT_NAME}",
-        description=(
-            f"**About {BOT_NAME}**\n"
-            f"A simple, high-quality music bot built for great sound and easy use, "
-            f"with native **Spotify** support — just drop a Spotify link into "
-            f"`{prefix}play`.\n"
-        ),
-        color=discord.Color.dark_teal(),
-    )
-    embed.add_field(
-        name="Supported Sources",
-        value="YouTube • SoundCloud • Spotify (track/album/playlist links)",
-        inline=False,
-    )
-    embed.add_field(
-        name="Features",
-        value=(
-            "Custom aliases for commands • Voice-activity logging • DJ role • "
-            "24/7 mode • Audio filters (bass boost) • Autoplay • Sticky messages"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="Quick Start",
-        value=(
-            f"1️⃣ Join a voice channel\n"
-            f"2️⃣ Type `{prefix}play [song name or Spotify link]`\n"
-            f"3️⃣ Explore commands below!\n"
-        ),
-        inline=False,
-    )
-    embed.add_field(name="📋 Browse Commands by Category", value="Use the menu below to explore.", inline=False)
-    embed.set_footer(text=f"{BOT_NAME} • Prefix: {prefix}")
-    return embed
+@bot.command(name="ban")
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.ban(reason=reason)
+    await ctx.send(f"🔨 Banned **{member}**. Reason: {reason}")
 
 
-def build_category_embed(prefix, key):
-    cat = HELP_CATEGORIES[key]
-    embed = discord.Embed(
-        title=cat["title"],
-        description=f"{len(cat['lines'])} command(s) available",
-        color=discord.Color.dark_teal(),
-    )
-    text = "\n".join(line.format(p=prefix) for line in cat["lines"])
-    embed.add_field(name="\u200b", value=text, inline=False)
-    embed.set_footer(text=f"{BOT_NAME} • Prefix: {prefix}")
-    return embed
+@bot.command(name="unban")
+@commands.has_permissions(ban_members=True)
+async def unban(ctx, *, user: str):
+    banned = [entry async for entry in ctx.guild.bans()]
+    target = None
+    if user.isdigit():
+        target = discord.utils.find(lambda b: b.user.id == int(user), banned)
+    else:
+        target = discord.utils.find(lambda b: str(b.user) == user or b.user.name == user, banned)
+
+    if target is None:
+        await ctx.send("Couldn't find that user in the ban list.")
+        return
+
+    await ctx.guild.unban(target.user)
+    await ctx.send(f"✅ Unbanned **{target.user}**.")
 
 
-class HelpCategorySelect(discord.ui.Select):
-    def __init__(self, prefix):
-        self.prefix = prefix
-        options = [
-            discord.SelectOption(
-                label=HELP_CATEGORIES[key]["label"],
-                description=HELP_CATEGORIES[key]["description"],
-                emoji=HELP_CATEGORIES[key]["emoji"],
-                value=key,
-            )
-            for key in HELP_CATEGORY_ORDER
-        ]
-        super().__init__(placeholder="Choose a category to explore...", options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        key = self.values[0]
-        embed = build_category_embed(self.prefix, key)
-        await interaction.response.edit_message(embed=embed, view=self.view)
+@bot.command(name="kick")
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.kick(reason=reason)
+    await ctx.send(f"👢 Kicked **{member}**. Reason: {reason}")
 
 
-class HelpView(discord.ui.View):
-    def __init__(self, prefix):
-        super().__init__(timeout=120)
-        self.prefix = prefix
-        self.add_item(HelpCategorySelect(prefix))
+@bot.command(name="timeout")
+@commands.has_permissions(moderate_members=True)
+async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason provided"):
+    duration = datetime.timedelta(minutes=minutes)
+    await member.timeout(duration, reason=reason)
+    await ctx.send(f"🔇 Timed out **{member}** for **{minutes} minute(s)**. Reason: {reason}")
 
-        if SUPPORT_SERVER_URL:
-            self.add_item(discord.ui.Button(label="Support Server", url=SUPPORT_SERVER_URL, style=discord.ButtonStyle.link))
-        if INVITE_URL:
-            self.add_item(discord.ui.Button(label="Invite Bot", url=INVITE_URL, style=discord.ButtonStyle.link))
 
-    @discord.ui.button(label="Back to Overview", style=discord.ButtonStyle.secondary, row=2)
-    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_overview_embed(self.prefix)
-        await interaction.response.edit_message(embed=embed, view=self)
+@bot.command(name="untimeout")
+@commands.has_permissions(moderate_members=True)
+async def untimeout(ctx, member: discord.Member):
+    await member.timeout(None)
+    await ctx.send(f"🔊 Removed timeout from **{member}**.")
+
+
+@bot.command(name="clear")
+@commands.has_permissions(manage_messages=True)
+async def clear(ctx, amount: int = 5):
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+
+@bot.command(name="sticky")
+@commands.has_permissions(manage_messages=True)
+async def sticky(ctx, *, content: str):
+    channel_id = ctx.channel.id
+    old = sticky_messages.get(channel_id)
+    if old and old.get("message"):
+        try:
+            await old["message"].delete()
+        except Exception:
+            pass
+    msg = await ctx.send(f"📌 {content}")
+    sticky_messages[channel_id] = {"content": content, "message": msg}
+
+
+@bot.command(name="stickyoff")
+@commands.has_permissions(manage_messages=True)
+async def stickyoff(ctx):
+    channel_id = ctx.channel.id
+    old = sticky_messages.pop(channel_id, None)
+    if old and old.get("message"):
+        try:
+            await old["message"].delete()
+        except Exception:
+            pass
+    await ctx.send("Sticky message removed.")
 
 
 @bot.command(name="help")
 async def custom_help(ctx):
     prefix = get_prefix(bot, ctx.message)
-    embed = build_overview_embed(prefix)
-    view = HelpView(prefix)
-    await ctx.send(embed=embed, view=view)
+
+    embed = discord.Embed(
+        title="🎶 Music Bot — Command List",
+        description=f"Prefix: **`{prefix}`**\nExample: `{prefix}play believer`",
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="▶️ Playback",
+        value=(
+            f"`{prefix}play <song>` — Search & play/queue a song\n"
+            f"`{prefix}pause` / `{prefix}resume` — Pause or resume\n"
+            f"`{prefix}skip` — Skip current song\n"
+            f"`{prefix}previous` — Go back to the last song\n"
+            f"`{prefix}stop` — Stop and clear queue\n"
+            f"`{prefix}restart` — Restart current song"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎯 Navigation",
+        value=(
+            f"`{prefix}seek <mm:ss>` — Jump to a position\n"
+            f"`{prefix}forward [secs]` — Skip forward (default 10s)\n"
+            f"`{prefix}rewind [secs]` — Skip backward (default 10s)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📜 Queue",
+        value=(
+            f"`{prefix}queue` — Show the current queue\n"
+            f"`{prefix}shuffle` — Shuffle the queue\n"
+            f"`{prefix}loop [off/one/queue]` — Set loop mode\n"
+            f"`{prefix}autoplay [on/off]` — Auto-continue with related songs"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔊 Audio",
+        value=(
+            f"`{prefix}volume [0-100]` — View/set volume\n"
+            f"`{prefix}bass [0-20]` — View/set bass boost"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ Voice & Settings",
+        value=(
+            f"`{prefix}join` — Join your voice channel\n"
+            f"`{prefix}leave` — Leave voice channel\n"
+            f"`{prefix}nowplaying` — Show current song details\n"
+            f"`{prefix}setprefix <new>` — Change prefix (Admin only)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🛡️ Moderation",
+        value=(
+            f"`{prefix}ban @user [reason]` — Ban a member\n"
+            f"`{prefix}unban <username or ID>` — Unban a member\n"
+            f"`{prefix}kick @user [reason]` — Kick a member\n"
+            f"`{prefix}timeout @user <minutes> [reason]` — Timeout a member\n"
+            f"`{prefix}untimeout @user` — Remove a timeout\n"
+            f"`{prefix}clear <amount>` — Delete recent messages\n"
+            f"`{prefix}sticky <message>` — Pin a repeating sticky message\n"
+            f"`{prefix}stickyoff` — Remove the sticky message"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🛠️ Utility",
+        value=f"`{prefix}ping` — Check bot latency\n`{prefix}voteskip` — Vote to skip the current song",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔧 Admin & Config",
+        value=(
+            f"`{prefix}setuplogs [#channel]` — Set the voice-activity/logs channel\n"
+            f"`{prefix}removelogs` — Disable logging\n"
+            f"`{prefix}dj role <@role>` — Restrict music commands to a DJ role\n"
+            f"`{prefix}247 on/off` — Stay in voice channel 24/7\n"
+            f"`{prefix}botchannel add/remove/list/clear [#channel]` — Restrict commands to channels\n"
+            f"`{prefix}aliases set/remove/list/clear <alias> <command>` — Custom command aliases\n"
+            f"`{prefix}settings view` — Show all current server settings"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Tip: Use the buttons on the Now Playing card for quick controls too!")
+    await ctx.send(embed=embed)
 
 
 if __name__ == "__main__":
