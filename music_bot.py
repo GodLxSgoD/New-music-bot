@@ -89,6 +89,14 @@ voice_join_times = {}
 dj_roles = {}
 # Per-guild 24/7 mode toggle
 stay_247 = {}
+# Per-guild welcome/leave message config: {"channel_id":, "join_message":, "leave_message":}
+welcome_config = {}
+# Per-guild leveling: {(guild_id, user_id): {"xp": int, "level": int}}
+level_data = {}
+# Anti-spam cooldown for chat XP: {(guild_id, user_id): timestamp}
+last_xp_time = {}
+# Per-guild channel for level-up announcements (None = same channel as activity)
+level_channels = {}
 # Per-guild allowed bot-command channels (empty set = allowed everywhere)
 bot_channels = {}
 # Per-guild command aliases: {alias: real_command_name}
@@ -531,6 +539,17 @@ async def on_message(message):
                 real = guild_aliases[cmd_word]
                 message.content = prefix + real + (" " + parts[1] if len(parts) > 1 else "")
 
+    # Chat XP (with cooldown to prevent spam-farming)
+    if message.guild:
+        import random
+        key = (message.guild.id, message.author.id)
+        now_ts = datetime.datetime.utcnow().timestamp()
+        if now_ts - last_xp_time.get(key, 0) >= 60:
+            last_xp_time[key] = now_ts
+            await grant_xp_and_announce(
+                message.guild, message.author, random.randint(5, 15), fallback_channel=message.channel
+            )
+
     await bot.process_commands(message)
 
 
@@ -562,6 +581,49 @@ async def send_log(guild, description, color=discord.Color.blurple()):
         pass
 
 
+# ---------- LEVELING SYSTEM ----------
+
+def xp_for_level(level):
+    # Fast early levels, slows down as level increases (classic XP curve)
+    return 5 * (level ** 2) + 50 * level + 100
+
+
+def add_xp(guild_id, user_id, amount):
+    key = (guild_id, user_id)
+    data = level_data.setdefault(key, {"xp": 0, "level": 0})
+    data["xp"] += amount
+    leveled_up = False
+    while data["xp"] >= xp_for_level(data["level"]):
+        data["xp"] -= xp_for_level(data["level"])
+        data["level"] += 1
+        leveled_up = True
+    return leveled_up, data["level"]
+
+
+async def grant_xp_and_announce(guild, member, amount, fallback_channel=None):
+    leveled_up, new_level = add_xp(guild.id, member.id, amount)
+    if not leveled_up:
+        return
+    channel_id = level_channels.get(guild.id)
+    channel = guild.get_channel(channel_id) if channel_id else fallback_channel
+    if not channel:
+        channel = guild.system_channel
+    if not channel:
+        return
+    embed = discord.Embed(
+        title="🎉 Level Up!",
+        description=f"{member.mention} just reached **Level {new_level}**!",
+        color=discord.Color.gold(),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"{member} • Keep chatting and hanging out in voice to level up!")
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        pass
+
+
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
@@ -586,6 +648,9 @@ async def on_voice_state_update(member, before, after):
         if joined_at:
             seconds = (datetime.datetime.utcnow() - joined_at).total_seconds()
             duration_text = f" (stayed {format_time(seconds)})"
+            xp_gain = int((seconds / 60) * 4)  # 4 XP per minute in voice
+            if xp_gain > 0:
+                await grant_xp_and_announce(guild, member, xp_gain, fallback_channel=None)
         await send_log(
             guild,
             f"🔇 **{member}** left voice channel **{before.channel.name}**{duration_text}",
@@ -599,6 +664,52 @@ async def on_voice_state_update(member, before, after):
             f"🔀 **{member}** moved from **{before.channel.name}** to **{after.channel.name}**",
             color=discord.Color.gold(),
         )
+
+
+DEFAULT_JOIN_MESSAGE = "👋 Welcome {mention} to **{server}**! We're now **{membercount}** members strong."
+DEFAULT_LEAVE_MESSAGE = "😢 **{user}** has left **{server}**. We're now **{membercount}** members."
+
+
+@bot.event
+async def on_member_join(member):
+    config = welcome_config.get(member.guild.id)
+    if not config or not config.get("channel_id"):
+        return
+    channel = member.guild.get_channel(config["channel_id"])
+    if not channel:
+        return
+    template = config.get("join_message", DEFAULT_JOIN_MESSAGE)
+    text = template.format(
+        mention=member.mention,
+        user=str(member),
+        server=member.guild.name,
+        membercount=member.guild.member_count,
+    )
+    try:
+        await channel.send(text)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_member_remove(member):
+    config = welcome_config.get(member.guild.id)
+    if not config or not config.get("channel_id"):
+        return
+    channel = member.guild.get_channel(config["channel_id"])
+    if not channel:
+        return
+    template = config.get("leave_message", DEFAULT_LEAVE_MESSAGE)
+    text = template.format(
+        mention=member.mention,
+        user=str(member),
+        server=member.guild.name,
+        membercount=member.guild.member_count,
+    )
+    try:
+        await channel.send(text)
+    except Exception:
+        pass
 
 
 @bot.command(name="setprefix")
@@ -1332,6 +1443,107 @@ async def global_music_check(ctx):
     return True
 
 
+@bot.group(name="welcome", invoke_without_command=True)
+@commands.has_permissions(manage_guild=True)
+async def welcome(ctx):
+    config = welcome_config.get(ctx.guild.id, {})
+    channel = ctx.guild.get_channel(config["channel_id"]) if config.get("channel_id") else None
+    await ctx.send(
+        f"**Welcome channel:** {channel.mention if channel else 'Not set'}\n"
+        f"**Join message:** {config.get('join_message', DEFAULT_JOIN_MESSAGE)}\n"
+        f"**Leave message:** {config.get('leave_message', DEFAULT_LEAVE_MESSAGE)}\n\n"
+        f"Use `mwelcome channel #channel`, `mwelcome message <text>`, "
+        f"`mwelcome leavemessage <text>`, `mwelcome test`\n"
+        f"Placeholders: `{{mention}}` `{{user}}` `{{server}}` `{{membercount}}`"
+    )
+
+
+@welcome.command(name="channel")
+@commands.has_permissions(manage_guild=True)
+async def welcome_channel(ctx, channel: discord.TextChannel):
+    guild_id = ctx.guild.id
+    config = welcome_config.setdefault(guild_id, {})
+    config["channel_id"] = channel.id
+    try:
+        overwrite = channel.overwrites_for(ctx.guild.default_role)
+        overwrite.send_messages = False
+        await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+        await ctx.send(f"✅ Welcome channel set to {channel.mention} and locked so only the bot can post there.")
+    except discord.Forbidden:
+        await ctx.send(
+            f"✅ Welcome channel set to {channel.mention}, but I couldn't lock it "
+            "(need **Manage Channels** permission) — lock it manually if you want it bot-only."
+        )
+
+
+@welcome.command(name="message")
+@commands.has_permissions(manage_guild=True)
+async def welcome_message(ctx, *, text: str):
+    welcome_config.setdefault(ctx.guild.id, {})["join_message"] = text
+    await ctx.send("✅ Join message updated.")
+
+
+@welcome.command(name="leavemessage")
+@commands.has_permissions(manage_guild=True)
+async def welcome_leavemessage(ctx, *, text: str):
+    welcome_config.setdefault(ctx.guild.id, {})["leave_message"] = text
+    await ctx.send("✅ Leave message updated.")
+
+
+@welcome.command(name="test")
+async def welcome_test(ctx):
+    config = welcome_config.get(ctx.guild.id, {})
+    template = config.get("join_message", DEFAULT_JOIN_MESSAGE)
+    text = template.format(
+        mention=ctx.author.mention, user=str(ctx.author),
+        server=ctx.guild.name, membercount=ctx.guild.member_count,
+    )
+    await ctx.send(f"**Preview:**\n{text}")
+
+
+@bot.command(name="level", aliases=["rank"])
+async def level_cmd(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    data = level_data.get((ctx.guild.id, member.id), {"xp": 0, "level": 0})
+    needed = xp_for_level(data["level"])
+    bar = make_progress_bar(data["xp"], needed, length=15)
+    embed = discord.Embed(title=f"📊 {member}'s Level", color=discord.Color.blurple())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Level", value=str(data["level"]), inline=True)
+    embed.add_field(name="XP", value=f"{data['xp']}/{needed}", inline=True)
+    embed.add_field(name="Progress", value=bar, inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="leaderboard", aliases=["lb"])
+async def leaderboard(ctx):
+    guild_id = ctx.guild.id
+    entries = [(uid, d) for (gid, uid), d in level_data.items() if gid == guild_id]
+    if not entries:
+        await ctx.send("No activity recorded yet.")
+        return
+    entries.sort(key=lambda e: (e[1]["level"], e[1]["xp"]), reverse=True)
+    lines = []
+    for i, (uid, d) in enumerate(entries[:10]):
+        member = ctx.guild.get_member(uid)
+        name = str(member) if member else f"User {uid}"
+        lines.append(f"**{i+1}.** {name} — Level {d['level']} ({d['xp']} XP)")
+    embed = discord.Embed(title="🏆 Leaderboard", description="\n".join(lines), color=discord.Color.gold())
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="setlevelchannel")
+@commands.has_permissions(manage_guild=True)
+async def setlevelchannel(ctx, channel: discord.TextChannel = None):
+    guild_id = ctx.guild.id
+    if channel is None:
+        level_channels.pop(guild_id, None)
+        await ctx.send("Level-up announcements will now be sent wherever the XP was earned.")
+        return
+    level_channels[guild_id] = channel.id
+    await ctx.send(f"✅ Level-up announcements will be sent in {channel.mention}.")
+
+
 @bot.command(name="ping")
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
@@ -1688,6 +1900,20 @@ HELP_CATEGORIES = {
             f"`{p}avatar [@user]` — Show a user's avatar\n"
             f"`{p}userinfo [@user]` — Show user info\n"
             f"`{p}serverinfo` — Show server info"
+        ),
+    },
+    "welcome": {
+        "label": "Welcome & Levels",
+        "desc": "Welcome/leave messages and leveling",
+        "emoji": "🎉",
+        "commands": lambda p: (
+            f"`{p}welcome channel #channel` — Set + lock the welcome channel (Admin)\n"
+            f"`{p}welcome message <text>` — Set the join message (Admin)\n"
+            f"`{p}welcome leavemessage <text>` — Set the leave message (Admin)\n"
+            f"`{p}welcome test` — Preview the join message\n"
+            f"`{p}level [@user]` (`{p}rank`) — Show a level & XP progress\n"
+            f"`{p}leaderboard` (`{p}lb`) — Top members by XP\n"
+            f"`{p}setlevelchannel #channel` — Set level-up announcement channel (Admin)"
         ),
     },
 }
