@@ -3,6 +3,7 @@ import datetime
 import os
 import re
 import discord
+import aiohttp
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
@@ -33,6 +34,7 @@ def get_prefix(bot, message):
 
 bot = commands.Bot(command_prefix=get_prefix, intents=intents)
 bot.remove_command("help")
+bot_start_time = datetime.datetime.utcnow()
 
 ytdl_format_options = {
     "format": "bestaudio[abr>0]/bestaudio/best",
@@ -57,8 +59,10 @@ ytdl_sc = youtube_dl.YoutubeDL(sc_format_options)
 
 # Used for Autoplay: fetches a YouTube "Mix"/radio playlist based on the last played video
 radio_format_options = dict(ytdl_format_options)
+radio_format_options.pop("format", None)
 radio_format_options["noplaylist"] = False
 radio_format_options["playlistend"] = 5
+radio_format_options["extract_flat"] = "in_playlist"
 ytdl_radio = youtube_dl.YoutubeDL(radio_format_options)
 
 # Per-server song queue
@@ -111,9 +115,24 @@ def get_bass(guild_id):
     return bass_levels[guild_id]
 
 
+# Per-guild active special filter (nightcore/vaporwave/8d/karaoke/treble), None = off
+active_filters = {}
+
+FILTER_PRESETS = {
+    "nightcore": "asetrate=48000*1.25,aresample=48000",
+    "vaporwave": "asetrate=48000*0.8,aresample=48000",
+    "8d": "apulsator=hz=0.08",
+    "karaoke": "pan=stereo|c0=c0-c1|c1=c1-c0",
+    "treble": "treble=g=5",
+}
+
+
 def get_ffmpeg_options(guild_id):
     bass = get_bass(guild_id)
-    audio_filter = f"bass=g={bass},dynaudnorm=f=150:g=15"
+    audio_filter = f"bass=g={bass},dynaudnorm=f=500:g=5"
+    extra = FILTER_PRESETS.get(active_filters.get(guild_id))
+    if extra:
+        audio_filter += f",{extra}"
     return {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         "options": f"-vn -b:a 320k -af {audio_filter}",
@@ -189,10 +208,11 @@ def fetch_autoplay_song(last_song):
     for entry in entries:
         if not entry:
             continue
-        if entry.get("id") == video_id:
+        entry_id = entry.get("id")
+        if not entry_id or entry_id == video_id:
             continue  # skip the same song
         try:
-            full = ytdl.extract_info(entry["url"], download=False)
+            full = ytdl.extract_info(f"https://www.youtube.com/watch?v={entry_id}", download=False)
         except Exception:
             continue
         return Song(
@@ -751,7 +771,7 @@ async def stop(ctx):
     await ctx.send("Stopped and cleared the queue.")
 
 
-@bot.command(name="leave")
+@bot.command(name="leave", aliases=["disconnect"])
 async def leave(ctx):
     guild_id = ctx.guild.id
     if guild_id in now_playing:
@@ -778,6 +798,32 @@ async def bass(ctx, level: int = None):
     await ctx.send(f"Bass boost set to: **{level}** — this will apply from the next song.")
 
 
+@bot.command(name="filter")
+async def filter_cmd(ctx, name: str = None):
+    guild_id = ctx.guild.id
+    valid = list(FILTER_PRESETS.keys()) + ["bassboost", "clear"]
+    if name is None:
+        current = active_filters.get(guild_id, "none")
+        await ctx.send(f"Current filter: **{current}**\nAvailable: {', '.join(valid)}")
+        return
+    name = name.lower()
+    if name == "clear":
+        active_filters.pop(guild_id, None)
+        bass_levels[guild_id] = 3
+        await ctx.send("Filters cleared — applies from the next song.")
+        return
+    if name == "bassboost":
+        bass_levels[guild_id] = 12
+        active_filters.pop(guild_id, None)
+        await ctx.send("🔊 Bass boost filter applied — applies from the next song.")
+        return
+    if name not in FILTER_PRESETS:
+        await ctx.send(f"Unknown filter. Available: {', '.join(valid)}")
+        return
+    active_filters[guild_id] = name
+    await ctx.send(f"🎚️ Filter **{name}** applied — applies from the next song (use `mrestart` to hear it now).")
+
+
 @bot.command(name="volume")
 async def volume(ctx, level: int = None):
     guild_id = ctx.guild.id
@@ -798,7 +844,7 @@ async def volume(ctx, level: int = None):
     await ctx.send(f"Volume set to: **{level}%**")
 
 
-@bot.command(name="nowplaying")
+@bot.command(name="nowplaying", aliases=["np"])
 async def nowplaying(ctx):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
@@ -880,6 +926,172 @@ async def show_queue(ctx):
         return
     msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
     await ctx.send(f"**Queue:**\n{msg}")
+
+
+@bot.command(name="skipto")
+async def skipto(ctx, number: int):
+    queue = get_queue(ctx.guild.id)
+    if number < 1 or number > len(queue):
+        await ctx.send("Invalid queue position.")
+        return
+    del queue[: number - 1]
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+    else:
+        play_next(ctx)
+    await ctx.send(f"⏭️ Skipping to song #{number} in the queue.")
+
+
+@bot.command(name="remove")
+async def remove_song(ctx, number: int):
+    queue = get_queue(ctx.guild.id)
+    if number < 1 or number > len(queue):
+        await ctx.send("Invalid queue position.")
+        return
+    removed = queue.pop(number - 1)
+    await ctx.send(f"🗑️ Removed **{removed.title}** from the queue.")
+
+
+@bot.command(name="clearqueue")
+async def clearqueue(ctx):
+    queue = get_queue(ctx.guild.id)
+    queue.clear()
+    await ctx.send("🧹 Queue cleared (current song keeps playing).")
+
+
+@bot.command(name="search")
+async def search_cmd(ctx, *, query: str):
+    loop = asyncio.get_event_loop()
+    search_opts = dict(ytdl_format_options)
+    search_opts["default_search"] = "ytsearch5"
+    search_opts.pop("extractor_args", None)
+    searcher = youtube_dl.YoutubeDL(search_opts)
+    try:
+        data = await loop.run_in_executor(None, lambda: searcher.extract_info(query, download=False))
+    except Exception as e:
+        await ctx.send(f"Search failed: {e}")
+        return
+    entries = data.get("entries") or []
+    if not entries:
+        await ctx.send("No results found.")
+        return
+    lines = "\n".join(f"{i+1}. {e.get('title', 'Unknown')}" for i, e in enumerate(entries[:5]))
+    await ctx.send(f"🔎 **Results for '{query}':**\n{lines}\n\nUse `mplay <song name>` to play one.")
+
+
+# ---------- PLAYLISTS (per-user, in-memory) ----------
+playlists = {}  # user_id -> {playlist_name: [{"title":, "url":}]}
+playlist_active = {}  # user_id -> currently active playlist name
+
+
+@bot.group(name="playlist", invoke_without_command=True)
+async def playlist(ctx):
+    user_playlists = playlists.get(ctx.author.id, {})
+    if not user_playlists:
+        await ctx.send("You have no playlists yet. Create one with `mplaylist create <name>`.")
+        return
+    lines = "\n".join(f"• {n} ({len(songs)} songs)" for n, songs in user_playlists.items())
+    await ctx.send(f"**Your Playlists:**\n{lines}")
+
+
+@playlist.command(name="create")
+async def playlist_create(ctx, *, name: str):
+    user_playlists = playlists.setdefault(ctx.author.id, {})
+    if name in user_playlists:
+        await ctx.send("You already have a playlist with that name.")
+        return
+    user_playlists[name] = []
+    playlist_active[ctx.author.id] = name
+    await ctx.send(f"📂 Created playlist **{name}** and set it as active.")
+
+
+@playlist.command(name="add")
+async def playlist_add(ctx, *, query: str):
+    name = playlist_active.get(ctx.author.id)
+    if not name:
+        await ctx.send("No active playlist. Create one first: `mplaylist create <name>`")
+        return
+    try:
+        song = await search_song(query)
+    except Exception as e:
+        await ctx.send(f"Couldn't find that song: {e}")
+        return
+    playlists[ctx.author.id][name].append({"title": song.title, "url": song.webpage_url or query})
+    await ctx.send(f"➕ Added **{song.title}** to **{name}**.")
+
+
+@playlist.command(name="remove")
+async def playlist_remove(ctx, *, query: str):
+    name = playlist_active.get(ctx.author.id)
+    if not name:
+        await ctx.send("No active playlist.")
+        return
+    songs = playlists[ctx.author.id][name]
+    for s in songs:
+        if query.lower() in s["title"].lower():
+            songs.remove(s)
+            await ctx.send(f"➖ Removed **{s['title']}** from **{name}**.")
+            return
+    await ctx.send("Song not found in the active playlist.")
+
+
+@playlist.command(name="play")
+async def playlist_play(ctx, *, name: str):
+    user_playlists = playlists.get(ctx.author.id, {})
+    if name not in user_playlists or not user_playlists[name]:
+        await ctx.send("That playlist doesn't exist or is empty.")
+        return
+    if ctx.author.voice is None:
+        await ctx.send("You need to join a voice channel first.")
+        return
+    if ctx.voice_client is None:
+        await ctx.author.voice.channel.connect()
+
+    queue = get_queue(ctx.guild.id)
+    added = 0
+    for entry in user_playlists[name]:
+        try:
+            song = await search_song(entry["url"])
+            queue.append(song)
+            added += 1
+        except Exception:
+            continue
+    await ctx.send(f"▶️ Queued {added} song(s) from **{name}**.")
+    if not ctx.voice_client.is_playing():
+        play_next(ctx)
+
+
+@playlist.command(name="delete")
+async def playlist_delete(ctx, *, name: str):
+    user_playlists = playlists.get(ctx.author.id, {})
+    if name in user_playlists:
+        del user_playlists[name]
+        if playlist_active.get(ctx.author.id) == name:
+            playlist_active.pop(ctx.author.id, None)
+        await ctx.send(f"🗑️ Deleted playlist **{name}**.")
+    else:
+        await ctx.send("That playlist doesn't exist.")
+
+
+@playlist.command(name="list")
+async def playlist_list(ctx, *, name: str = None):
+    user_playlists = playlists.get(ctx.author.id, {})
+    if name is None:
+        if not user_playlists:
+            await ctx.send("You have no playlists.")
+            return
+        lines = "\n".join(f"• {n} ({len(s)} songs)" for n, s in user_playlists.items())
+        await ctx.send(f"**Your Playlists:**\n{lines}")
+        return
+    if name not in user_playlists:
+        await ctx.send("That playlist doesn't exist.")
+        return
+    songs = user_playlists[name]
+    if not songs:
+        await ctx.send(f"**{name}** is empty.")
+        return
+    lines = "\n".join(f"{i+1}. {s['title']}" for i, s in enumerate(songs))
+    await ctx.send(f"**{name}:**\n{lines}")
 
 
 # ---------- LOGS & ADMIN CONFIG ----------
@@ -1124,6 +1336,159 @@ async def global_music_check(ctx):
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: **{latency_ms}ms**")
+
+
+@bot.command(name="lyrics")
+async def lyrics(ctx, *, query: str = None):
+    guild_id = ctx.guild.id
+    if query is None:
+        info = now_playing.get(guild_id)
+        if not info:
+            await ctx.send("Nothing is playing — provide a song name: `mlyrics <song>`")
+            return
+        query = info["song"].title
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://some-random-api.com/lyrics", params={"title": query}, timeout=10
+            ) as resp:
+                if resp.status != 200:
+                    await ctx.send("Couldn't find lyrics for that song.")
+                    return
+                data = await resp.json()
+    except Exception:
+        await ctx.send("Lyrics service is unavailable right now.")
+        return
+
+    lyrics_text = data.get("lyrics", "")
+    title = data.get("title", query)
+    artist = data.get("author", "Unknown")
+    if not lyrics_text:
+        await ctx.send("Couldn't find lyrics for that song.")
+        return
+    if len(lyrics_text) > 4000:
+        lyrics_text = lyrics_text[:4000] + "..."
+    embed = discord.Embed(title=f"🎤 {title} — {artist}", description=lyrics_text, color=discord.Color.blurple())
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="info", aliases=["botinfo"])
+async def info_cmd(ctx):
+    uptime = datetime.datetime.utcnow() - bot_start_time
+    embed = discord.Embed(
+        title=f"🎶 {bot.user.name}",
+        description="A feature-rich music & moderation bot.",
+        color=discord.Color.blurple(),
+    )
+    if bot.user.avatar:
+        embed.set_thumbnail(url=bot.user.avatar.url)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Uptime", value=format_time(uptime.total_seconds()), inline=True)
+    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Prefix", value=f"`{get_prefix(bot, ctx.message)}`", inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="invite")
+async def invite(ctx):
+    url = (
+        f"https://discord.com/api/oauth2/authorize?client_id={bot.user.id}"
+        "&permissions=277062483008&scope=bot"
+    )
+    await ctx.send(f"🔗 Invite me to your server: {url}")
+
+
+@bot.command(name="stats")
+async def stats(ctx):
+    total_voice = sum(1 for g in bot.guilds if g.voice_client)
+    embed = discord.Embed(title="📊 Bot Stats", color=discord.Color.blurple())
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Active Voice Connections", value=str(total_voice), inline=True)
+    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="uptime")
+async def uptime(ctx):
+    uptime_delta = datetime.datetime.utcnow() - bot_start_time
+    await ctx.send(f"⏱️ Uptime: **{format_time(uptime_delta.total_seconds())}**")
+
+
+@bot.command(name="avatar")
+async def avatar(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"{member}'s Avatar", color=discord.Color.blurple())
+    embed.set_image(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="userinfo")
+async def userinfo(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"👤 {member}", color=discord.Color.blurple())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ID", value=str(member.id), inline=True)
+    embed.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown", inline=True)
+    embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
+    roles = ", ".join(r.mention for r in member.roles if r.name != "@everyone")
+    embed.add_field(name="Roles", value=roles or "None", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="serverinfo")
+async def serverinfo(ctx):
+    guild = ctx.guild
+    embed = discord.Embed(title=f"🏠 {guild.name}", color=discord.Color.blurple())
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="Owner", value=str(guild.owner), inline=True)
+    embed.add_field(name="Members", value=str(guild.member_count), inline=True)
+    embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Text Channels", value=str(len(guild.text_channels)), inline=True)
+    embed.add_field(name="Voice Channels", value=str(len(guild.voice_channels)), inline=True)
+    embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="restrict")
+@commands.has_permissions(manage_guild=True)
+async def restrict(ctx, action: str = None, channel: discord.TextChannel = None):
+    await botchannel(ctx, action, channel)
+
+
+@bot.command(name="language")
+async def language(ctx):
+    await ctx.send("🌐 This bot currently only supports **English**. More languages may be added in the future.")
+
+
+@bot.command(name="setup")
+@commands.has_permissions(manage_guild=True)
+async def setup_cmd(ctx):
+    await ctx.send(
+        "⚙️ **Quick setup:**\n"
+        f"1. `{get_prefix(bot, ctx.message)}setuplogs #channel` — set a logs channel\n"
+        f"2. `{get_prefix(bot, ctx.message)}dj role @role` — restrict music to a DJ role (optional)\n"
+        f"3. `{get_prefix(bot, ctx.message)}botchannel add #channel` — restrict commands to a channel (optional)\n"
+        f"4. `{get_prefix(bot, ctx.message)}settings view` — review your settings anytime"
+    )
+
+
+@bot.command(name="reset")
+@commands.has_permissions(administrator=True)
+async def reset_cmd(ctx):
+    guild_id = ctx.guild.id
+    for store in (prefixes, dj_roles, logs_channels, stay_247, bass_levels, volumes,
+                  loop_modes, autoplay_flags, active_filters, command_aliases):
+        store.pop(guild_id, None)
+    bot_channels.pop(guild_id, None)
+    await ctx.send("♻️ All server settings have been reset to default.")
+
+
+@bot.command(name="reload")
+@commands.has_permissions(administrator=True)
+async def reload_cmd(ctx):
+    await ctx.send("🔄 Settings refreshed. (Live commands don't require a restart.)")
 
 
 @bot.command(name="ban")
