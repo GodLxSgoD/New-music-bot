@@ -37,7 +37,6 @@ ytdl_format_options = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "ignoreerrors": True,
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "web", "ios", "tv"],
@@ -53,14 +52,6 @@ sc_format_options["default_search"] = "scsearch"
 sc_format_options.pop("extractor_args", None)
 ytdl_sc = youtube_dl.YoutubeDL(sc_format_options)
 
-SEARCH_RESULT_COUNT = 4  # how many candidates to try before giving up
-
-# Flat extractor used only to quickly list related videos (no full resolve)
-flat_format_options = dict(ytdl_format_options)
-flat_format_options["extract_flat"] = True
-flat_format_options["noplaylist"] = False
-ytdl_flat = youtube_dl.YoutubeDL(flat_format_options)
-
 # Per-server song queue
 queues = {}
 # Per-server volume level (default 0.5 = 50%)
@@ -69,12 +60,10 @@ volumes = {}
 bass_levels = {}
 # Tracks what's currently playing per server
 now_playing = {}
-# Per-server play history (for Previous button / autoplay dedup)
+# Per-server play history (for Previous button)
 history = {}
 # Per-server loop mode: "off", "one", "queue"
 loop_modes = {}
-# Per-server autoplay toggle
-autoplay_modes = {}
 
 
 def get_queue(guild_id):
@@ -116,146 +105,38 @@ def get_loop(guild_id):
     return loop_modes[guild_id]
 
 
-def get_autoplay(guild_id):
-    if guild_id not in autoplay_modes:
-        autoplay_modes[guild_id] = False
-    return autoplay_modes[guild_id]
-
-
 class Song:
-    def __init__(self, source_url, title, thumbnail=None, webpage_url=None,
-                 duration=0, source_name="YouTube", video_id=None):
+    def __init__(self, source_url, title, thumbnail=None, webpage_url=None, duration=0, source_name="YouTube"):
         self.source_url = source_url
         self.title = title
         self.thumbnail = thumbnail
         self.webpage_url = webpage_url
         self.duration = duration  # seconds
         self.source_name = source_name
-        self.video_id = video_id
-
-
-def _build_song_from_entry(entry, source_name):
-    if not entry:
-        return None
-    if not entry.get("url"):
-        return None
-    return Song(
-        entry["url"],
-        entry.get("title", "Unknown"),
-        thumbnail=entry.get("thumbnail"),
-        webpage_url=entry.get("webpage_url"),
-        duration=entry.get("duration", 0),
-        source_name=source_name,
-        video_id=entry.get("id"),
-    )
 
 
 async def search_song(query):
-    """Try several candidates on YouTube, then SoundCloud, skipping any
-    result that's DRM-protected / age-restricted / otherwise unplayable
-    instead of giving up on the very first hit."""
     loop = asyncio.get_event_loop()
-    is_url = query.startswith("http://") or query.startswith("https://")
-
-    def yt_search():
-        q = query if is_url else f"ytsearch{SEARCH_RESULT_COUNT}:{query}"
-        return ytdl.extract_info(q, download=False)
-
-    def sc_search():
-        q = query if is_url else f"scsearch{SEARCH_RESULT_COUNT}:{query}"
-        return ytdl_sc.extract_info(q, download=False)
-
-    # ---- try YouTube first ----
+    source_name = "YouTube"
     try:
-        data = await loop.run_in_executor(None, yt_search)
-    except Exception:
-        data = None
-
-    entries = (data.get("entries") if data and "entries" in data else [data]) if data else []
-    for entry in entries:
-        song = _build_song_from_entry(entry, "YouTube")
-        if song:
-            return song
-
-    # ---- fall back to SoundCloud ----
-    try:
-        data = await loop.run_in_executor(None, sc_search)
-    except Exception:
-        data = None
-
-    entries = (data.get("entries") if data and "entries" in data else [data]) if data else []
-    for entry in entries:
-        song = _build_song_from_entry(entry, "SoundCloud")
-        if song:
-            return song
-
-    raise Exception("no playable results (tracks may be DRM-protected, private, or region-locked)")
-
-
-async def get_related_song(song, guild_id):
-    """Find a related YouTube song to keep playback going when Autoplay is on."""
-    if not song.video_id or song.source_name != "YouTube":
-        return None
-
-    loop = asyncio.get_event_loop()
-    mix_url = f"https://www.youtube.com/watch?v={song.video_id}&list=RD{song.video_id}"
-
-    try:
-        flat_data = await loop.run_in_executor(
-            None, lambda: ytdl_flat.extract_info(mix_url, download=False)
+        data = await loop.run_in_executor(
+            None, lambda: ytdl.extract_info(query, download=False)
         )
     except Exception:
-        return None
-
-    entries = (flat_data or {}).get("entries") or []
-    if not entries:
-        return None
-
-    already_played = {s.video_id for s in get_history(guild_id) if s.video_id}
-    already_played.add(song.video_id)
-
-    candidate_id = None
-    for entry in entries:
-        if not entry:
-            continue
-        vid = entry.get("id")
-        if vid and vid not in already_played:
-            candidate_id = vid
-            break
-
-    if not candidate_id:
-        return None
-
-    try:
-        full_data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(candidate_id, download=False)
+        source_name = "SoundCloud"
+        data = await loop.run_in_executor(
+            None, lambda: ytdl_sc.extract_info(query, download=False)
         )
-    except Exception:
-        return None
-
-    if "entries" in full_data:
-        full_data = full_data["entries"][0]
-
+    if "entries" in data:
+        data = data["entries"][0]
     return Song(
-        full_data["url"],
-        full_data.get("title", "Unknown"),
-        thumbnail=full_data.get("thumbnail"),
-        webpage_url=full_data.get("webpage_url"),
-        duration=full_data.get("duration", 0),
-        source_name="YouTube",
-        video_id=full_data.get("id"),
+        data["url"],
+        data.get("title", "Unknown"),
+        thumbnail=data.get("thumbnail"),
+        webpage_url=data.get("webpage_url"),
+        duration=data.get("duration", 0),
+        source_name=source_name,
     )
-
-
-async def autoplay_next(ctx, finished_song):
-    """Fetch a related song and queue it up, called when queue is empty."""
-    guild_id = ctx.guild.id
-    related = await get_related_song(finished_song, guild_id)
-    if related:
-        get_queue(guild_id).append(related)
-        play_next(ctx)
-    else:
-        await ctx.send("Autoplay couldn't find a related song to continue with.")
 
 
 def format_time(seconds):
@@ -398,16 +279,6 @@ class MusicControls(discord.ui.View):
     async def seek_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SeekModal(self.ctx))
 
-    @discord.ui.button(label="Autoplay: off", style=discord.ButtonStyle.secondary, row=2, emoji="♾️")
-    async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = self.ctx.guild.id
-        current = get_autoplay(guild_id)
-        new_state = not current
-        autoplay_modes[guild_id] = new_state
-        button.label = f"Autoplay: {'on' if new_state else 'off'}"
-        button.style = discord.ButtonStyle.success if new_state else discord.ButtonStyle.secondary
-        await interaction.response.edit_message(view=self)
-
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=2)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.ctx.guild.id
@@ -456,12 +327,10 @@ def build_now_playing_embed(guild_id, song, elapsed=0):
     queue_count = len(get_queue(guild_id))
     volume_pct = int(get_volume(guild_id) * 100)
     loop_mode = get_loop(guild_id)
-    autoplay_status = "on" if get_autoplay(guild_id) else "off"
 
     embed.add_field(name="Queue", value=str(queue_count), inline=True)
     embed.add_field(name="Volume", value=f"{volume_pct}%", inline=True)
     embed.add_field(name="Loop", value=loop_mode, inline=True)
-    embed.add_field(name="Autoplay", value=autoplay_status, inline=True)
     embed.add_field(name="Source", value=song.source_name, inline=True)
     return embed
 
@@ -497,12 +366,7 @@ def play_song(ctx, song, seek_seconds=0):
             if mode == "queue":
                 get_queue(guild_id).append(song)
             get_history(guild_id).append(song)
-
-            if get_queue(guild_id):
-                play_next(ctx)
-            elif get_autoplay(guild_id):
-                asyncio.run_coroutine_threadsafe(autoplay_next(ctx, song), bot.loop)
-            # else: nothing left to play, stay idle
+            play_next(ctx)
 
     voice_client.play(source, after=after_play)
 
@@ -744,25 +608,6 @@ async def volume(ctx, level: int = None):
     await ctx.send(f"Volume set to: **{level}%**")
 
 
-@bot.command(name="autoplay")
-async def autoplay(ctx, state: str = None):
-    guild_id = ctx.guild.id
-    if state is None:
-        current = get_autoplay(guild_id)
-        await ctx.send(f"Autoplay is currently **{'on' if current else 'off'}**.")
-        return
-
-    state = state.lower()
-    if state in ("on", "true", "yes", "enable"):
-        autoplay_modes[guild_id] = True
-        await ctx.send("Autoplay turned **on** — I'll keep playing related songs once the queue is empty.")
-    elif state in ("off", "false", "no", "disable"):
-        autoplay_modes[guild_id] = False
-        await ctx.send("Autoplay turned **off**.")
-    else:
-        await ctx.send("Usage: `mautoplay on` or `mautoplay off`")
-
-
 @bot.command(name="nowplaying")
 async def nowplaying(ctx):
     guild_id = ctx.guild.id
@@ -780,4 +625,124 @@ async def nowplaying(ctx):
     await ctx.send(embed=embed, view=MusicControls(ctx))
 
 
-bot.run(BOT_TOKEN)
+@bot.command(name="loop")
+async def loop(ctx, mode: str = None):
+    guild_id = ctx.guild.id
+    if mode is None:
+        await ctx.send(f"Current loop mode: **{get_loop(guild_id)}**")
+        return
+    mode = mode.lower()
+    if mode not in ("off", "one", "queue"):
+        await ctx.send("Loop mode must be one of: `off`, `one`, `queue`")
+        return
+    loop_modes[guild_id] = mode
+    await ctx.send(f"Loop mode set to: **{mode}**")
+
+
+@bot.command(name="previous")
+async def previous(ctx):
+    guild_id = ctx.guild.id
+    hist = get_history(guild_id)
+    if not hist:
+        await ctx.send("No previous song.")
+        return
+    prev_song = hist.pop()
+    current = now_playing.get(guild_id)
+    if current:
+        get_queue(guild_id).insert(0, current["song"])
+        now_playing[guild_id]["manual_stop"] = True
+    if ctx.voice_client:
+        ctx.voice_client.stop()
+    play_song(ctx, prev_song, seek_seconds=0)
+
+
+@bot.command(name="shuffle")
+async def shuffle(ctx):
+    import random
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The queue is empty, nothing to shuffle.")
+        return
+    random.shuffle(queue)
+    await ctx.send("Queue shuffled.")
+
+
+@bot.command(name="queue")
+async def show_queue(ctx):
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The queue is empty.")
+        return
+    msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
+    await ctx.send(f"**Queue:**\n{msg}")
+
+
+@bot.command(name="help")
+async def custom_help(ctx):
+    prefix = get_prefix(bot, ctx.message)
+
+    embed = discord.Embed(
+        title="🎶 Music Bot — Command List",
+        description=f"Prefix: **`{prefix}`**\nExample: `{prefix}play believer`",
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="▶️ Playback",
+        value=(
+            f"`{prefix}play <song>` — Search & play/queue a song\n"
+            f"`{prefix}pause` / `{prefix}resume` — Pause or resume\n"
+            f"`{prefix}skip` — Skip current song\n"
+            f"`{prefix}previous` — Go back to the last song\n"
+            f"`{prefix}stop` — Stop and clear queue\n"
+            f"`{prefix}restart` — Restart current song"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎯 Navigation",
+        value=(
+            f"`{prefix}seek <mm:ss>` — Jump to a position\n"
+            f"`{prefix}forward [secs]` — Skip forward (default 10s)\n"
+            f"`{prefix}rewind [secs]` — Skip backward (default 10s)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📜 Queue",
+        value=(
+            f"`{prefix}queue` — Show the current queue\n"
+            f"`{prefix}shuffle` — Shuffle the queue\n"
+            f"`{prefix}loop [off/one/queue]` — Set loop mode"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔊 Audio",
+        value=(
+            f"`{prefix}volume [0-100]` — View/set volume\n"
+            f"`{prefix}bass [0-20]` — View/set bass boost"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ Voice & Settings",
+        value=(
+            f"`{prefix}join` — Join your voice channel\n"
+            f"`{prefix}leave` — Leave voice channel\n"
+            f"`{prefix}nowplaying` — Show current song details\n"
+            f"`{prefix}setprefix <new>` — Change prefix (Admin only)"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Tip: Use the buttons on the Now Playing card for quick controls too!")
+    await ctx.send(embed=embed)
+
+
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)
