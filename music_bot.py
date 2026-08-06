@@ -29,6 +29,7 @@ def get_prefix(bot, message):
 
 
 bot = commands.Bot(command_prefix=get_prefix, intents=intents)
+bot.remove_command("help")
 
 ytdl_format_options = {
     "format": "bestaudio[abr>0]/bestaudio/best",
@@ -674,6 +675,73 @@ async def show_queue(ctx):
         return
     msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
     await ctx.send(f"**Queue:**\n{msg}")
+
+
+@bot.command(name="help")
+async def custom_help(ctx):
+    prefix = get_prefix(bot, ctx.message)
+
+    embed = discord.Embed(
+        title="🎶 Music Bot — Command List",
+        description=f"Prefix: **`{prefix}`**\nExample: `{prefix}play believer`",
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="▶️ Playback",
+        value=(
+            f"`{prefix}play <song>` — Search & play/queue a song\n"
+            f"`{prefix}pause` / `{prefix}resume` — Pause or resume\n"
+            f"`{prefix}skip` — Skip current song\n"
+            f"`{prefix}previous` — Go back to the last song\n"
+            f"`{prefix}stop` — Stop and clear queue\n"
+            f"`{prefix}restart` — Restart current song"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎯 Navigation",
+        value=(
+            f"`{prefix}seek <mm:ss>` — Jump to a position\n"
+            f"`{prefix}forward [secs]` — Skip forward (default 10s)\n"
+            f"`{prefix}rewind [secs]` — Skip backward (default 10s)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📜 Queue",
+        value=(
+            f"`{prefix}queue` — Show the current queue\n"
+            f"`{prefix}shuffle` — Shuffle the queue\n"
+            f"`{prefix}loop [off/one/queue]` — Set loop mode"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔊 Audio",
+        value=(
+            f"`{prefix}volume [0-100]` — View/set volume\n"
+            f"`{prefix}bass [0-20]` — View/set bass boost"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ Voice & Settings",
+        value=(
+            f"`{prefix}join` — Join your voice channel\n"
+            f"`{prefix}leave` — Leave voice channel\n"
+            f"`{prefix}nowplaying` — Show current song details\n"
+            f"`{prefix}setprefix <new>` — Change prefix (Admin only)"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Tip: Use the buttons on the Now Playing card for quick controls too!")
+    await ctx.send(embed=embed)
 
 
 if __name__ == "__main__":
