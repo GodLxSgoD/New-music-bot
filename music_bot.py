@@ -129,7 +129,7 @@ FILTER_PRESETS = {
 
 def get_ffmpeg_options(guild_id):
     bass = get_bass(guild_id)
-    audio_filter = f"bass=g={bass},dynaudnorm=f=500:g=5"
+    audio_filter = f"bass=g={bass}"
     extra = FILTER_PRESETS.get(active_filters.get(guild_id))
     if extra:
         audio_filter += f",{extra}"
@@ -1574,107 +1574,217 @@ async def stickyoff(ctx):
     await ctx.send("Sticky message removed.")
 
 
+BOT_NAME = "TORMENTA MUSIC 2"
+
+HELP_CATEGORIES = {
+    "music": {
+        "label": "Music",
+        "desc": "Music playback commands",
+        "emoji": "🎶",
+        "commands": lambda p: (
+            f"`{p}play <song/url>` — Search & play/queue a song\n"
+            f"`{p}search <song>` — Search top 5 results\n"
+            f"`{p}queue` — Show the current queue\n"
+            f"`{p}nowplaying` (`{p}np`) — Show current song\n"
+            f"`{p}skip` — Skip current song\n"
+            f"`{p}skipto <number>` — Skip to a queue position\n"
+            f"`{p}previous` — Go back to the last song\n"
+            f"`{p}stop` — Stop and clear queue\n"
+            f"`{p}pause` / `{p}resume` — Pause or resume\n"
+            f"`{p}restart` — Restart current song\n"
+            f"`{p}loop [off/one/queue]` — Set loop mode\n"
+            f"`{p}shuffle` — Shuffle the queue\n"
+            f"`{p}remove <number>` — Remove a song from queue\n"
+            f"`{p}clearqueue` — Clear the queue\n"
+            f"`{p}volume [0-100]` — View/set volume\n"
+            f"`{p}seek <mm:ss>` — Jump to a position\n"
+            f"`{p}forward [secs]` / `{p}rewind [secs]` — Skip forward/back\n"
+            f"`{p}lyrics [song]` — Get lyrics\n"
+            f"`{p}autoplay [on/off]` — Auto-continue with related songs"
+        ),
+    },
+    "filters": {
+        "label": "Filters",
+        "desc": "Audio filter commands",
+        "emoji": "🎚️",
+        "commands": lambda p: (
+            f"`{p}filter bassboost` — Boost the bass\n"
+            f"`{p}filter nightcore` — Speed up + pitch up\n"
+            f"`{p}filter vaporwave` — Slow down + pitch down\n"
+            f"`{p}filter 8d` — Rotating 8D audio effect\n"
+            f"`{p}filter karaoke` — Reduce vocals\n"
+            f"`{p}filter treble` — Boost the treble\n"
+            f"`{p}filter clear` — Remove all filters\n"
+            f"`{p}bass [0-20]` — View/set bass boost level"
+        ),
+    },
+    "playlists": {
+        "label": "Playlists",
+        "desc": "Playlist management commands",
+        "emoji": "📂",
+        "commands": lambda p: (
+            f"`{p}playlist create <name>` — Create a playlist\n"
+            f"`{p}playlist add <song>` — Add a song to your active playlist\n"
+            f"`{p}playlist remove <song>` — Remove a song from it\n"
+            f"`{p}playlist play <name>` — Queue an entire playlist\n"
+            f"`{p}playlist delete <name>` — Delete a playlist\n"
+            f"`{p}playlist list [name]` — List your playlists or a playlist's songs"
+        ),
+    },
+    "voice": {
+        "label": "Voice",
+        "desc": "Voice channel commands",
+        "emoji": "🔊",
+        "commands": lambda p: (
+            f"`{p}join` — Join your voice channel\n"
+            f"`{p}leave` / `{p}disconnect` — Leave voice channel"
+        ),
+    },
+    "moderation": {
+        "label": "Moderation",
+        "desc": "Server moderation commands",
+        "emoji": "🛡️",
+        "commands": lambda p: (
+            f"`{p}ban @user [reason]` — Ban a member\n"
+            f"`{p}unban <username/ID>` — Unban a member\n"
+            f"`{p}kick @user [reason]` — Kick a member\n"
+            f"`{p}timeout @user <minutes> [reason]` — Timeout a member\n"
+            f"`{p}untimeout @user` — Remove a timeout\n"
+            f"`{p}clear <amount>` — Delete recent messages\n"
+            f"`{p}sticky <message>` / `{p}stickyoff` — Sticky message"
+        ),
+    },
+    "config": {
+        "label": "Config",
+        "desc": "Configuration commands",
+        "emoji": "🔧",
+        "commands": lambda p: (
+            f"`{p}setprefix <new>` — Change prefix (Admin)\n"
+            f"`{p}dj role <@role>` — Set a DJ role\n"
+            f"`{p}247 on/off` — Stay in voice 24/7\n"
+            f"`{p}botchannel add/remove/list/clear` — Restrict commands to channels\n"
+            f"`{p}restrict ...` — Alias for botchannel\n"
+            f"`{p}aliases set/remove/list/clear` — Custom command aliases\n"
+            f"`{p}settings view` — Show all server settings\n"
+            f"`{p}setuplogs [#channel]` / `{p}removelogs` — Voice activity logs\n"
+            f"`{p}setup` — Quick setup guide\n"
+            f"`{p}reset` — Reset all settings (Admin)\n"
+            f"`{p}reload` — Refresh settings"
+        ),
+    },
+    "general": {
+        "label": "General",
+        "desc": "General utility commands",
+        "emoji": "🌐",
+        "commands": lambda p: (
+            f"`{p}help` — Show this menu\n"
+            f"`{p}ping` — Check bot latency\n"
+            f"`{p}info` — Bot info\n"
+            f"`{p}invite` — Get the bot's invite link\n"
+            f"`{p}stats` — Bot statistics\n"
+            f"`{p}uptime` — Bot uptime\n"
+            f"`{p}language` — Supported languages\n"
+            f"`{p}voteskip` — Vote to skip the current song\n"
+            f"`{p}avatar [@user]` — Show a user's avatar\n"
+            f"`{p}userinfo [@user]` — Show user info\n"
+            f"`{p}serverinfo` — Show server info"
+        ),
+    },
+}
+
+
+def build_welcome_embed(prefix):
+    embed = discord.Embed(
+        title=f"Welcome! Let's Get Started with {BOT_NAME}",
+        description=(
+            f"**About {BOT_NAME}**\n"
+            "A simple, high-quality music bot built for great sound and easy use.\n\n"
+            "**Supported Platforms**\nYouTube • SoundCloud\n\n"
+            "**Features**\nCustom aliases • Audio filters • Playlist management • "
+            "Voice activity logs • Moderation tools • And much more!\n\n"
+            f"**Quick Start**\n"
+            f"1️⃣ Join a voice channel\n"
+            f"2️⃣ Type `{prefix}play [song name]`\n"
+            f"3️⃣ Explore commands below!\n\n"
+            "📋 **Browse Commands by Category**"
+        ),
+        color=discord.Color.dark_teal(),
+    )
+    if bot.user and bot.user.avatar:
+        embed.set_thumbnail(url=bot.user.avatar.url)
+    embed.set_footer(text=f"Prefix: {prefix} • Use the menu below to explore")
+    return embed
+
+
+def build_category_embed(key, prefix):
+    data = HELP_CATEGORIES[key]
+    embed = discord.Embed(
+        title=f"{data['emoji']} {data['label']} Commands",
+        description=data["commands"](prefix),
+        color=discord.Color.dark_teal(),
+    )
+    embed.set_footer(text=f"{BOT_NAME} • Prefix: {prefix}")
+    return embed
+
+
+def build_all_commands_embed(prefix):
+    embed = discord.Embed(
+        title=f"📖 {BOT_NAME} — All Commands",
+        color=discord.Color.dark_teal(),
+    )
+    for data in HELP_CATEGORIES.values():
+        embed.add_field(
+            name=f"{data['emoji']} {data['label']}",
+            value=data["commands"](prefix),
+            inline=False,
+        )
+    embed.set_footer(text=f"Prefix: {prefix}")
+    return embed
+
+
+class HelpBackView(discord.ui.View):
+    def __init__(self, prefix):
+        super().__init__(timeout=180)
+        self.prefix = prefix
+
+    @discord.ui.button(label="Back to Help Menu", style=discord.ButtonStyle.secondary)
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = build_welcome_embed(self.prefix)
+        await interaction.response.edit_message(embed=embed, view=HelpSelectView(self.prefix))
+
+
+class HelpCategorySelect(discord.ui.Select):
+    def __init__(self, prefix):
+        self.prefix = prefix
+        options = [
+            discord.SelectOption(label=data["label"], description=data["desc"], value=key, emoji=data["emoji"])
+            for key, data in HELP_CATEGORIES.items()
+        ]
+        super().__init__(placeholder="Choose a category to explore...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        key = self.values[0]
+        embed = build_category_embed(key, self.prefix)
+        await interaction.response.edit_message(embed=embed, view=HelpBackView(self.prefix))
+
+
+class HelpSelectView(discord.ui.View):
+    def __init__(self, prefix):
+        super().__init__(timeout=180)
+        self.prefix = prefix
+        self.add_item(HelpCategorySelect(prefix))
+
+    @discord.ui.button(label="View All Commands", style=discord.ButtonStyle.success, row=1)
+    async def view_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = build_all_commands_embed(self.prefix)
+        await interaction.response.edit_message(embed=embed, view=HelpBackView(self.prefix))
+
+
 @bot.command(name="help")
 async def custom_help(ctx):
     prefix = get_prefix(bot, ctx.message)
-
-    embed = discord.Embed(
-        title="🎶 Music Bot — Command List",
-        description=f"Prefix: **`{prefix}`**\nExample: `{prefix}play believer`",
-        color=discord.Color.blurple(),
-    )
-
-    embed.add_field(
-        name="▶️ Playback",
-        value=(
-            f"`{prefix}play <song>` — Search & play/queue a song\n"
-            f"`{prefix}pause` / `{prefix}resume` — Pause or resume\n"
-            f"`{prefix}skip` — Skip current song\n"
-            f"`{prefix}previous` — Go back to the last song\n"
-            f"`{prefix}stop` — Stop and clear queue\n"
-            f"`{prefix}restart` — Restart current song"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🎯 Navigation",
-        value=(
-            f"`{prefix}seek <mm:ss>` — Jump to a position\n"
-            f"`{prefix}forward [secs]` — Skip forward (default 10s)\n"
-            f"`{prefix}rewind [secs]` — Skip backward (default 10s)"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📜 Queue",
-        value=(
-            f"`{prefix}queue` — Show the current queue\n"
-            f"`{prefix}shuffle` — Shuffle the queue\n"
-            f"`{prefix}loop [off/one/queue]` — Set loop mode\n"
-            f"`{prefix}autoplay [on/off]` — Auto-continue with related songs"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🔊 Audio",
-        value=(
-            f"`{prefix}volume [0-100]` — View/set volume\n"
-            f"`{prefix}bass [0-20]` — View/set bass boost"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="⚙️ Voice & Settings",
-        value=(
-            f"`{prefix}join` — Join your voice channel\n"
-            f"`{prefix}leave` — Leave voice channel\n"
-            f"`{prefix}nowplaying` — Show current song details\n"
-            f"`{prefix}setprefix <new>` — Change prefix (Admin only)"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🛡️ Moderation",
-        value=(
-            f"`{prefix}ban @user [reason]` — Ban a member\n"
-            f"`{prefix}unban <username or ID>` — Unban a member\n"
-            f"`{prefix}kick @user [reason]` — Kick a member\n"
-            f"`{prefix}timeout @user <minutes> [reason]` — Timeout a member\n"
-            f"`{prefix}untimeout @user` — Remove a timeout\n"
-            f"`{prefix}clear <amount>` — Delete recent messages\n"
-            f"`{prefix}sticky <message>` — Pin a repeating sticky message\n"
-            f"`{prefix}stickyoff` — Remove the sticky message"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🛠️ Utility",
-        value=f"`{prefix}ping` — Check bot latency\n`{prefix}voteskip` — Vote to skip the current song",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🔧 Admin & Config",
-        value=(
-            f"`{prefix}setuplogs [#channel]` — Set the voice-activity/logs channel\n"
-            f"`{prefix}removelogs` — Disable logging\n"
-            f"`{prefix}dj role <@role>` — Restrict music commands to a DJ role\n"
-            f"`{prefix}247 on/off` — Stay in voice channel 24/7\n"
-            f"`{prefix}botchannel add/remove/list/clear [#channel]` — Restrict commands to channels\n"
-            f"`{prefix}aliases set/remove/list/clear <alias> <command>` — Custom command aliases\n"
-            f"`{prefix}settings view` — Show all current server settings"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(text="Tip: Use the buttons on the Now Playing card for quick controls too!")
-    await ctx.send(embed=embed)
+    embed = build_welcome_embed(prefix)
+    await ctx.send(embed=embed, view=HelpSelectView(prefix))
 
 
 if __name__ == "__main__":
