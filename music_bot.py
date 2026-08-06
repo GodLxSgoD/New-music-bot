@@ -37,6 +37,7 @@ ytdl_format_options = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "ignoreerrors": True,
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "web", "ios", "tv"],
@@ -51,6 +52,8 @@ sc_format_options = dict(ytdl_format_options)
 sc_format_options["default_search"] = "scsearch"
 sc_format_options.pop("extractor_args", None)
 ytdl_sc = youtube_dl.YoutubeDL(sc_format_options)
+
+SEARCH_RESULT_COUNT = 4  # how many candidates to try before giving up
 
 # Flat extractor used only to quickly list related videos (no full resolve)
 flat_format_options = dict(ytdl_format_options)
@@ -131,29 +134,62 @@ class Song:
         self.video_id = video_id
 
 
-async def search_song(query):
-    loop = asyncio.get_event_loop()
-    source_name = "YouTube"
-    try:
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(query, download=False)
-        )
-    except Exception:
-        source_name = "SoundCloud"
-        data = await loop.run_in_executor(
-            None, lambda: ytdl_sc.extract_info(query, download=False)
-        )
-    if "entries" in data:
-        data = data["entries"][0]
+def _build_song_from_entry(entry, source_name):
+    if not entry:
+        return None
+    if not entry.get("url"):
+        return None
     return Song(
-        data["url"],
-        data.get("title", "Unknown"),
-        thumbnail=data.get("thumbnail"),
-        webpage_url=data.get("webpage_url"),
-        duration=data.get("duration", 0),
+        entry["url"],
+        entry.get("title", "Unknown"),
+        thumbnail=entry.get("thumbnail"),
+        webpage_url=entry.get("webpage_url"),
+        duration=entry.get("duration", 0),
         source_name=source_name,
-        video_id=data.get("id"),
+        video_id=entry.get("id"),
     )
+
+
+async def search_song(query):
+    """Try several candidates on YouTube, then SoundCloud, skipping any
+    result that's DRM-protected / age-restricted / otherwise unplayable
+    instead of giving up on the very first hit."""
+    loop = asyncio.get_event_loop()
+    is_url = query.startswith("http://") or query.startswith("https://")
+
+    def yt_search():
+        q = query if is_url else f"ytsearch{SEARCH_RESULT_COUNT}:{query}"
+        return ytdl.extract_info(q, download=False)
+
+    def sc_search():
+        q = query if is_url else f"scsearch{SEARCH_RESULT_COUNT}:{query}"
+        return ytdl_sc.extract_info(q, download=False)
+
+    # ---- try YouTube first ----
+    try:
+        data = await loop.run_in_executor(None, yt_search)
+    except Exception:
+        data = None
+
+    entries = (data.get("entries") if data and "entries" in data else [data]) if data else []
+    for entry in entries:
+        song = _build_song_from_entry(entry, "YouTube")
+        if song:
+            return song
+
+    # ---- fall back to SoundCloud ----
+    try:
+        data = await loop.run_in_executor(None, sc_search)
+    except Exception:
+        data = None
+
+    entries = (data.get("entries") if data and "entries" in data else [data]) if data else []
+    for entry in entries:
+        song = _build_song_from_entry(entry, "SoundCloud")
+        if song:
+            return song
+
+    raise Exception("no playable results (tracks may be DRM-protected, private, or region-locked)")
 
 
 async def get_related_song(song, guild_id):
