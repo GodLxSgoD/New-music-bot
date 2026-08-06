@@ -6,7 +6,7 @@ import yt_dlp as youtube_dl
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-DEFAULT_PREFIX = "M,m"
+DEFAULT_PREFIX = "m"
 # -----------------------------
 
 if not BOT_TOKEN:
