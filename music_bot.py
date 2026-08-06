@@ -11,14 +11,14 @@ DEFAULT_PREFIX = "m"
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "DISCORD_BOT_TOKEN environment variable set kora nei. "
-        "Railway-e Variables tab-e giye add koro."
+        "DISCORD_BOT_TOKEN environment variable is not set. "
+        "Go to Railway's Variables tab and add it."
     )
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-# Prottek server-er jonno alada prefix
+# Per-server custom prefix
 prefixes = {}
 
 
@@ -45,13 +45,13 @@ ytdl_format_options = {
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
-# Prottek server-er jonno alada queue
+# Per-server song queue
 queues = {}
-# Prottek server-er jonno alada volume level (default 0.5 = 50%)
+# Per-server volume level (default 0.5 = 50%)
 volumes = {}
-# Prottek server-er jonno alada bass boost level (default 8)
+# Per-server bass boost level (default 8)
 bass_levels = {}
-# Prottek server-e ekhon ja bajche tar tracking: {guild_id: {"song": Song, "started_at": time.time(), "seek_offset": int}}
+# Tracks what's currently playing per server
 now_playing = {}
 
 
@@ -116,7 +116,6 @@ def format_time(seconds):
 
 
 def parse_time(text):
-    # "1:30" -> 90, "90" -> 90
     parts = text.split(":")
     parts = [int(p) for p in parts]
     seconds = 0
@@ -125,10 +124,10 @@ def parse_time(text):
     return seconds
 
 
-class SeekModal(discord.ui.Modal, title="Gaan-er kono jaygay jete chao?"):
+class SeekModal(discord.ui.Modal, title="Jump to a position in the song"):
     position = discord.ui.TextInput(
-        label="Shomoy (mm:ss ba shudhu seconds)",
-        placeholder="jemon: 1:30",
+        label="Time (mm:ss or just seconds)",
+        placeholder="e.g. 1:30",
         required=True,
         max_length=10,
     )
@@ -141,18 +140,18 @@ class SeekModal(discord.ui.Modal, title="Gaan-er kono jaygay jete chao?"):
         guild_id = self.ctx.guild.id
         info = now_playing.get(guild_id)
         if not info or not self.ctx.voice_client:
-            await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
             return
         try:
             seconds = parse_time(self.position.value)
         except ValueError:
-            await interaction.response.send_message("Shomoy thik moto dao, jemon `1:30`.", ephemeral=True)
+            await interaction.response.send_message("Please enter a valid time, e.g. `1:30`.", ephemeral=True)
             return
 
         song = info["song"]
         if song.duration and seconds > song.duration:
             await interaction.response.send_message(
-                f"Gaan-er duration {format_time(song.duration)}, eto boro shomoy-e jete parba na.",
+                f"The song is only {format_time(song.duration)} long, you can't seek past that.",
                 ephemeral=True,
             )
             return
@@ -162,7 +161,7 @@ class SeekModal(discord.ui.Modal, title="Gaan-er kono jaygay jete chao?"):
         info["manual_stop"] = True
         self.ctx.voice_client.stop()
         play_song(self.ctx, song, seek_seconds=seconds)
-        await interaction.response.send_message(f"Jump kora holo: **{format_time(seconds)}**", ephemeral=True)
+        await interaction.response.send_message(f"Jumped to: **{format_time(seconds)}**", ephemeral=True)
 
 
 def make_progress_bar(elapsed, duration, length=20):
@@ -193,26 +192,26 @@ class MusicControls(discord.ui.View):
             button.style = discord.ButtonStyle.secondary
             await interaction.response.edit_message(view=self)
         else:
-            await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = self.ctx.voice_client
         if vc and vc.is_playing():
             vc.stop()
-            await interaction.response.send_message("Skip kora holo.", ephemeral=True)
+            await interaction.response.send_message("Skipped.", ephemeral=True)
         else:
-            await interaction.response.send_message("Ekhon kichu bajche na.", ephemeral=True)
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         import random
         queue = get_queue(self.ctx.guild.id)
         if not queue:
-            await interaction.response.send_message("Queue khali.", ephemeral=True)
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
             return
         random.shuffle(queue)
-        await interaction.response.send_message("Queue shuffle kora holo.", ephemeral=True)
+        await interaction.response.send_message("Queue shuffled.", ephemeral=True)
 
     @discord.ui.button(label="Seek", style=discord.ButtonStyle.secondary, emoji="🎯")
     async def seek_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -228,7 +227,7 @@ class MusicControls(discord.ui.View):
         vc = self.ctx.voice_client
         if vc:
             vc.stop()
-        await interaction.response.send_message("Stop kora holo, queue clear.", ephemeral=True)
+        await interaction.response.send_message("Stopped and cleared the queue.", ephemeral=True)
 
 
 def get_elapsed(guild_id):
@@ -262,7 +261,6 @@ def play_song(ctx, song, seek_seconds=0):
     def after_play(error):
         if error:
             print(f"Playback error: {error}")
-        # Jodi user seek/restart korche tahole eikhane notun kore queue theke pull hobe na
         if now_playing.get(guild_id, {}).get("song") is song and not now_playing[guild_id].get("manual_stop"):
             play_next(ctx)
 
@@ -277,7 +275,7 @@ def play_song(ctx, song, seek_seconds=0):
         embed.set_thumbnail(url=song.thumbnail)
     if song.duration:
         embed.add_field(name="Duration", value=format_time(song.duration))
-        embed.add_field(name="Shuru hocche", value=format_time(seek_seconds))
+        embed.add_field(name="Starting at", value=format_time(seek_seconds))
 
     view = MusicControls(ctx)
     asyncio.run_coroutine_threadsafe(
@@ -306,18 +304,18 @@ async def on_ready():
 @commands.has_permissions(administrator=True)
 async def setprefix(ctx, new_prefix: str):
     if len(new_prefix) > 5:
-        await ctx.send("Prefix beshi boro hoye gelo, choto kichu dao (max 5 character).")
+        await ctx.send("That prefix is too long, please use something shorter (max 5 characters).")
         return
     prefixes[ctx.guild.id] = new_prefix
-    await ctx.send(f"Prefix change kora holo: **{new_prefix}**")
+    await ctx.send(f"Prefix changed to: **{new_prefix}**")
 
 
 @setprefix.error
 async def setprefix_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("Eta korar jonno tomar Admin permission lagbe.")
+        await ctx.send("You need Administrator permission to do that.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Notun prefix dite hobe, jemon: `!setprefix ?`")
+        await ctx.send("Please provide a new prefix, e.g. `msetprefix ?`")
 
 
 @bot.command(name="seek")
@@ -325,18 +323,18 @@ async def seek(ctx, position: str):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
     if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
-        await ctx.send("Ekhon kichu bajche na.")
+        await ctx.send("Nothing is playing right now.")
         return
 
     try:
         seconds = parse_time(position)
     except ValueError:
-        await ctx.send("Shomoy thik moto dao, jemon: `mseek 1:30` ba `mseek 90`")
+        await ctx.send("Please enter a valid time, e.g.: `mseek 1:30` or `mseek 90`")
         return
 
     song = info["song"]
     if song.duration and seconds > song.duration:
-        await ctx.send(f"Gaan-er duration {format_time(song.duration)}, eto boro shomoy-e jete parba na.")
+        await ctx.send(f"The song is only {format_time(song.duration)} long, you can't seek past that.")
         return
     if seconds < 0:
         seconds = 0
@@ -351,7 +349,7 @@ async def restart(ctx):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
     if not info or not ctx.voice_client:
-        await ctx.send("Ekhon kichu bajche na.")
+        await ctx.send("Nothing is playing right now.")
         return
     song = info["song"]
     info["manual_stop"] = True
@@ -364,7 +362,7 @@ async def forward(ctx, seconds: int = 10):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
     if not info or not ctx.voice_client:
-        await ctx.send("Ekhon kichu bajche na.")
+        await ctx.send("Nothing is playing right now.")
         return
     new_pos = int(get_elapsed(guild_id)) + seconds
     song = info["song"]
@@ -380,7 +378,7 @@ async def rewind(ctx, seconds: int = 10):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
     if not info or not ctx.voice_client:
-        await ctx.send("Ekhon kichu bajche na.")
+        await ctx.send("Nothing is playing right now.")
         return
     new_pos = int(get_elapsed(guild_id)) - seconds
     if new_pos < 0:
@@ -394,7 +392,7 @@ async def rewind(ctx, seconds: int = 10):
 @bot.command(name="join")
 async def join(ctx):
     if ctx.author.voice is None:
-        await ctx.send("Age ekta voice channel e join koro.")
+        await ctx.send("You need to join a voice channel first.")
         return
     channel = ctx.author.voice.channel
     if ctx.voice_client is None:
@@ -407,24 +405,24 @@ async def join(ctx):
 @bot.command(name="play")
 async def play(ctx, *, query: str):
     if ctx.author.voice is None:
-        await ctx.send("Age voice channel e join koro.")
+        await ctx.send("You need to join a voice channel first.")
         return
 
     if ctx.voice_client is None:
         await ctx.author.voice.channel.connect()
 
-    await ctx.send(f"Khujchi: **{query}** ...")
+    await ctx.send(f"Searching: **{query}** ...")
     try:
         song = await search_song(query)
     except Exception as e:
-        await ctx.send(f"Song khunje pawa jaini: {e}")
+        await ctx.send(f"Couldn't find that song: {e}")
         return
 
     queue = get_queue(ctx.guild.id)
     queue.append(song)
 
     embed = discord.Embed(
-        title="Queue-te jog holo",
+        title="Added to Queue",
         description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
         color=discord.Color.blurple(),
     )
@@ -440,23 +438,23 @@ async def play(ctx, *, query: str):
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        await ctx.send("Skip kora holo.")
+        await ctx.send("Skipped.")
     else:
-        await ctx.send("Ekhon kichu bajche na.")
+        await ctx.send("Nothing is playing right now.")
 
 
 @bot.command(name="pause")
 async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
-        await ctx.send("Pause kora holo.")
+        await ctx.send("Paused.")
 
 
 @bot.command(name="resume")
 async def resume(ctx):
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
-        await ctx.send("Abar chalu kora holo.")
+        await ctx.send("Resumed.")
 
 
 @bot.command(name="stop")
@@ -468,7 +466,7 @@ async def stop(ctx):
         now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         ctx.voice_client.stop()
-    await ctx.send("Stop kora holo, queue clear.")
+    await ctx.send("Stopped and cleared the queue.")
 
 
 @bot.command(name="leave")
@@ -478,22 +476,22 @@ async def leave(ctx):
         now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-        await ctx.send("Voice channel theke ber hoye gelam.")
+        await ctx.send("Left the voice channel.")
 
 
 @bot.command(name="bass")
 async def bass(ctx, level: int = None):
     guild_id = ctx.guild.id
     if level is None:
-        await ctx.send(f"Ekhon bass boost: **{get_bass(guild_id)}**")
+        await ctx.send(f"Current bass boost: **{get_bass(guild_id)}**")
         return
 
     if level < 0 or level > 20:
-        await ctx.send("Bass level 0 theke 20-er moddhe dao (default 8).")
+        await ctx.send("Bass level must be between 0 and 20 (default 8).")
         return
 
     bass_levels[guild_id] = level
-    await ctx.send(f"Bass boost set kora holo: **{level}** — notun gaan theke effect ashbe.")
+    await ctx.send(f"Bass boost set to: **{level}** — this will apply from the next song.")
 
 
 @bot.command(name="volume")
@@ -501,11 +499,11 @@ async def volume(ctx, level: int = None):
     guild_id = ctx.guild.id
     if level is None:
         current = int(get_volume(guild_id) * 100)
-        await ctx.send(f"Ekhon volume: **{current}%**")
+        await ctx.send(f"Current volume: **{current}%**")
         return
 
     if level < 0 or level > 100:
-        await ctx.send("Volume 0 theke 100-er moddhe dite hobe.")
+        await ctx.send("Volume must be between 0 and 100.")
         return
 
     volumes[guild_id] = level / 100
@@ -513,7 +511,7 @@ async def volume(ctx, level: int = None):
     if ctx.voice_client and ctx.voice_client.source:
         ctx.voice_client.source.volume = level / 100
 
-    await ctx.send(f"Volume set kora holo: **{level}%**")
+    await ctx.send(f"Volume set to: **{level}%**")
 
 
 @bot.command(name="nowplaying")
@@ -521,7 +519,7 @@ async def nowplaying(ctx):
     guild_id = ctx.guild.id
     info = now_playing.get(guild_id)
     if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
-        await ctx.send("Ekhon kichu bajche na.")
+        await ctx.send("Nothing is playing right now.")
         return
 
     song = info["song"]
@@ -551,17 +549,17 @@ async def shuffle(ctx):
     import random
     queue = get_queue(ctx.guild.id)
     if not queue:
-        await ctx.send("Queue khali, shuffle korar kichu nei.")
+        await ctx.send("The queue is empty, nothing to shuffle.")
         return
     random.shuffle(queue)
-    await ctx.send("Queue shuffle kora holo.")
+    await ctx.send("Queue shuffled.")
 
 
 @bot.command(name="queue")
 async def show_queue(ctx):
     queue = get_queue(ctx.guild.id)
     if not queue:
-        await ctx.send("Queue khali.")
+        await ctx.send("The queue is empty.")
         return
     msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
     await ctx.send(f"**Queue:**\n{msg}")
@@ -569,4 +567,3 @@ async def show_queue(ctx):
 
 if __name__ == "__main__":
     bot.run(BOT_TOKEN)
-    
