@@ -77,6 +77,20 @@ loop_modes = {}
 autoplay_flags = {}
 # Per-channel sticky message: {channel_id: {"content": str, "message": discord.Message}}
 sticky_messages = {}
+# Per-guild logs channel id
+logs_channels = {}
+# Tracks when each user joined a voice channel: {(guild_id, user_id): datetime}
+voice_join_times = {}
+# Per-guild DJ role id (None = no restriction)
+dj_roles = {}
+# Per-guild 24/7 mode toggle
+stay_247 = {}
+# Per-guild allowed bot-command channels (empty set = allowed everywhere)
+bot_channels = {}
+# Per-guild command aliases: {alias: real_command_name}
+command_aliases = {}
+# Per-guild active vote-skip votes: {guild_id: set(user_id)}
+voteskip_votes = {}
 
 
 def get_queue(guild_id):
@@ -416,6 +430,7 @@ def play_song(ctx, song, seek_seconds=0):
         "started_at": time.time(),
         "seek_offset": seek_seconds,
     }
+    voteskip_votes.pop(guild_id, None)
 
     def after_play(error):
         if error:
@@ -442,6 +457,10 @@ def play_song(ctx, song, seek_seconds=0):
     view = MusicControls(ctx)
     asyncio.run_coroutine_threadsafe(
         ctx.send(embed=embed, view=view), bot.loop
+    )
+    asyncio.run_coroutine_threadsafe(
+        send_log(ctx.guild, f"🎵 **{ctx.author}** is now playing **{song.title}** in **{voice_client.channel.name}**"),
+        bot.loop,
     )
 
 
@@ -480,6 +499,18 @@ async def on_message(message):
         except Exception:
             pass
 
+    # Resolve custom command aliases
+    if message.guild:
+        prefix = get_prefix(bot, message)
+        if isinstance(prefix, str) and message.content.startswith(prefix):
+            rest = message.content[len(prefix):]
+            parts = rest.split(" ", 1)
+            cmd_word = parts[0].lower()
+            guild_aliases = command_aliases.get(message.guild.id, {})
+            if cmd_word in guild_aliases:
+                real = guild_aliases[cmd_word]
+                message.content = prefix + real + (" " + parts[1] if len(parts) > 1 else "")
+
     await bot.process_commands(message)
 
 
@@ -495,6 +526,59 @@ async def on_command_error(ctx, error):
         pass
     else:
         print(f"Unhandled command error: {error}")
+
+
+async def send_log(guild, description, color=discord.Color.blurple()):
+    channel_id = logs_channels.get(guild.id)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    embed = discord.Embed(description=description, color=color, timestamp=discord.utils.utcnow())
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+
+    guild = member.guild
+    key = (guild.id, member.id)
+
+    # User joined a voice channel
+    if before.channel is None and after.channel is not None:
+        voice_join_times[key] = datetime.datetime.utcnow()
+        await send_log(
+            guild,
+            f"🔊 **{member}** joined voice channel **{after.channel.name}**",
+            color=discord.Color.green(),
+        )
+
+    # User left a voice channel entirely
+    elif before.channel is not None and after.channel is None:
+        joined_at = voice_join_times.pop(key, None)
+        duration_text = ""
+        if joined_at:
+            seconds = (datetime.datetime.utcnow() - joined_at).total_seconds()
+            duration_text = f" (stayed {format_time(seconds)})"
+        await send_log(
+            guild,
+            f"🔇 **{member}** left voice channel **{before.channel.name}**{duration_text}",
+            color=discord.Color.red(),
+        )
+
+    # User switched voice channels
+    elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+        await send_log(
+            guild,
+            f"🔀 **{member}** moved from **{before.channel.name}** to **{after.channel.name}**",
+            color=discord.Color.gold(),
+        )
 
 
 @bot.command(name="setprefix")
@@ -597,6 +681,7 @@ async def join(ctx):
     else:
         await ctx.voice_client.move_to(channel)
     await ctx.send(f"Joined **{channel.name}**")
+    await send_log(ctx.guild, f"🤖 Bot joined **{channel.name}** (requested by {ctx.author})", color=discord.Color.blue())
 
 
 @bot.command(name="play")
@@ -672,8 +757,10 @@ async def leave(ctx):
     if guild_id in now_playing:
         now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
+        channel_name = ctx.voice_client.channel.name
         await ctx.voice_client.disconnect()
         await ctx.send("Left the voice channel.")
+        await send_log(ctx.guild, f"🤖 Bot left **{channel_name}** (requested by {ctx.author})", color=discord.Color.blue())
 
 
 @bot.command(name="bass")
@@ -795,320 +882,242 @@ async def show_queue(ctx):
     await ctx.send(f"**Queue:**\n{msg}")
 
 
-# Active scrims: {message_id: {"slots": int, "description": str, "host_id": int, "host_name": str, "registered": [user_id]}}
-scrims = {}
+# ---------- LOGS & ADMIN CONFIG ----------
 
-
-def build_scrim_embed(data):
-    embed = discord.Embed(
-        title="⚔️ Scrim",
-        description=data["description"],
-        color=discord.Color.gold(),
-    )
-    embed.add_field(name="Slots", value=f"{len(data['registered'])}/{data['slots']}", inline=True)
-    if data["registered"]:
-        names = "\n".join(f"<@{uid}>" for uid in data["registered"])
-    else:
-        names = "No one registered yet."
-    embed.add_field(name="Registered", value=names, inline=False)
-    embed.set_footer(text=f"Hosted by {data['host_name']}")
-    return embed
-
-
-class ScrimView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Register", style=discord.ButtonStyle.success)
-    async def register_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = scrims.get(interaction.message.id)
-        if not data:
-            await interaction.response.send_message("This scrim is no longer active.", ephemeral=True)
-            return
-        uid = interaction.user.id
-        if uid in data["registered"]:
-            await interaction.response.send_message("You're already registered.", ephemeral=True)
-            return
-        if len(data["registered"]) >= data["slots"]:
-            await interaction.response.send_message("This scrim is full.", ephemeral=True)
-            return
-        data["registered"].append(uid)
-        await interaction.response.edit_message(embed=build_scrim_embed(data), view=self)
-
-    @discord.ui.button(label="Unregister", style=discord.ButtonStyle.danger)
-    async def unregister_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = scrims.get(interaction.message.id)
-        if not data:
-            await interaction.response.send_message("This scrim is no longer active.", ephemeral=True)
-            return
-        uid = interaction.user.id
-        if uid not in data["registered"]:
-            await interaction.response.send_message("You're not registered for this scrim.", ephemeral=True)
-            return
-        data["registered"].remove(uid)
-        await interaction.response.edit_message(embed=build_scrim_embed(data), view=self)
-
-    @discord.ui.button(label="Close Registration", style=discord.ButtonStyle.secondary)
-    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = scrims.get(interaction.message.id)
-        if not data:
-            await interaction.response.send_message("This scrim is no longer active.", ephemeral=True)
-            return
-        if interaction.user.id != data["host_id"] and not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("Only the host or a moderator can close this scrim.", ephemeral=True)
-            return
-        for child in self.children:
-            child.disabled = True
-        embed = build_scrim_embed(data)
-        embed.title = "⚔️ Scrim (Closed)"
-        scrims.pop(interaction.message.id, None)
-        await interaction.response.edit_message(embed=embed, view=self)
-
-
-@bot.command(name="scrim")
-async def scrim(ctx, slots: int, *, details: str):
-    if slots < 1 or slots > 50:
-        await ctx.send("Slots must be between 1 and 50.")
-        return
-    data = {
-        "slots": slots,
-        "description": details,
-        "host_id": ctx.author.id,
-        "host_name": str(ctx.author),
-        "registered": [],
-    }
-    embed = build_scrim_embed(data)
-    msg = await ctx.send(embed=embed, view=ScrimView())
-    scrims[msg.id] = data
-
-
-# ---------- SCRIM / TOURNAMENT SLOT SYSTEM ----------
-# slot_groups: {group_key: {"name":, "date":, "time_info":, "capacity":, "teams":[{leader_id, team_name, members, channel_id}], "closed": bool, "message": discord.Message}}
-slot_groups = {}
-
-
-def build_group_embed(key, data):
-    filled = len(data["teams"])
-    cap = data["capacity"]
-    bar = make_progress_bar(filled, cap, length=15)
-    status = "🔒 CLOSED" if data["closed"] else ("🟢 OPEN" if filled < cap else "🟠 FULL")
-    embed = discord.Embed(
-        title=f"⚡ {data['name']} — Group {key}",
-        description=f"📅 **{data['date']}**\n⏰ {data['time_info']}",
-        color=discord.Color.orange() if data["closed"] else discord.Color.green(),
-    )
-    embed.add_field(name="Status", value=status, inline=True)
-    embed.add_field(name="Slots", value=f"{filled}/{cap} filled\n{bar}", inline=False)
-    if data["teams"]:
-        team_list = "\n".join(f"• {t['team_name']}" for t in data["teams"])
-        embed.add_field(name="Registered Teams", value=team_list, inline=False)
-    embed.set_footer(text="Auto-updates on registration")
-    return embed
-
-
-class RegisterModal(discord.ui.Modal, title="Team Registration"):
-    team_name = discord.ui.TextInput(label="Team Name", placeholder="e.g. Team Alpha", max_length=50)
-    player_ids = discord.ui.TextInput(
-        label="Player IDs (one per line)",
-        style=discord.TextStyle.paragraph,
-        placeholder="Player1 - 12345\nPlayer2 - 67890\n...",
-        max_length=500,
-    )
-
-    def __init__(self, group_key):
-        super().__init__()
-        self.group_key = group_key
-
-    async def on_submit(self, interaction: discord.Interaction):
-        data = slot_groups.get(self.group_key)
-        if not data or data["closed"]:
-            await interaction.response.send_message("Registration is closed for this group.", ephemeral=True)
-            return
-        if len(data["teams"]) >= data["capacity"]:
-            await interaction.response.send_message("This group is already full.", ephemeral=True)
-            return
-        if any(t["leader_id"] == interaction.user.id for t in data["teams"]):
-            await interaction.response.send_message("You've already registered a team in this group.", ephemeral=True)
-            return
-
-        team = {
-            "leader_id": interaction.user.id,
-            "team_name": self.team_name.value,
-            "members": self.player_ids.value,
-            "channel_id": None,
-        }
-        data["teams"].append(team)
-
-        if data.get("message"):
-            try:
-                await data["message"].edit(embed=build_group_embed(self.group_key, data))
-            except Exception:
-                pass
-
-        # Create a private team channel
-        guild = interaction.guild
-        try:
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            }
-            channel = await guild.create_text_channel(
-                name=f"team-{self.team_name.value}"[:90],
-                overwrites=overwrites,
-                reason="Scrim team registration",
-            )
-            team["channel_id"] = channel.id
-            info_embed = discord.Embed(
-                title=f"✅ {self.team_name.value} — Confirmed",
-                description=f"Group **{self.group_key}** ({data['name']})",
-                color=discord.Color.green(),
-            )
-            info_embed.add_field(name="Leader", value=interaction.user.mention, inline=False)
-            info_embed.add_field(name="Player IDs", value=self.player_ids.value, inline=False)
-            await channel.send(embed=info_embed)
-        except discord.Forbidden:
-            pass
-
-        await interaction.response.send_message(
-            f"Registered **{self.team_name.value}** for Group {self.group_key}!", ephemeral=True
-        )
-
-
-class SlotGroupView(discord.ui.View):
-    def __init__(self, group_key):
-        super().__init__(timeout=None)
-        self.group_key = group_key
-
-    @discord.ui.button(label="⚡ Register Team", style=discord.ButtonStyle.success)
-    async def register_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        data = slot_groups.get(self.group_key)
-        if not data or data["closed"]:
-            await interaction.response.send_message("Registration is closed for this group.", ephemeral=True)
-            return
-        await interaction.response.send_modal(RegisterModal(self.group_key))
-
-
-@bot.command(name="createslot")
+@bot.command(name="setuplogs")
 @commands.has_permissions(manage_guild=True)
-async def createslot(ctx, group_key: str, capacity: int, date: str, *, time_info: str):
-    if group_key in slot_groups:
-        await ctx.send("A group with that key already exists.")
-        return
-    data = {
-        "name": "Scrim Qualifiers",
-        "date": date,
-        "time_info": time_info,
-        "capacity": capacity,
-        "teams": [],
-        "closed": False,
-        "message": None,
-    }
-    slot_groups[group_key] = data
-    view = SlotGroupView(group_key)
-    msg = await ctx.send(embed=build_group_embed(group_key, data), view=view)
-    data["message"] = msg
+async def setuplogs(ctx, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    logs_channels[ctx.guild.id] = channel.id
+    await ctx.send(f"✅ Logs will now be sent to {channel.mention}.")
+    await send_log(ctx.guild, "📋 Logging channel set up.", color=discord.Color.blue())
 
 
-@bot.command(name="slots")
-async def slots(ctx):
-    if not slot_groups:
-        await ctx.send("No active slot groups right now.")
+@bot.command(name="removelogs")
+@commands.has_permissions(manage_guild=True)
+async def removelogs(ctx):
+    logs_channels.pop(ctx.guild.id, None)
+    await ctx.send("Logging disabled.")
+
+
+@bot.group(name="dj", invoke_without_command=True)
+async def dj(ctx):
+    role_id = dj_roles.get(ctx.guild.id)
+    if role_id:
+        role = ctx.guild.get_role(role_id)
+        await ctx.send(f"Current DJ role: {role.mention if role else '(role deleted)'}")
+    else:
+        await ctx.send("No DJ role set. Everyone can use music commands.")
+
+
+@dj.command(name="role")
+@commands.has_permissions(manage_guild=True)
+async def dj_role(ctx, role: discord.Role = None):
+    if role is None:
+        dj_roles.pop(ctx.guild.id, None)
+        await ctx.send("DJ role restriction removed — everyone can use music commands again.")
         return
-    embed = discord.Embed(title="📋 Slot Groups Overview", color=discord.Color.blurple())
-    for key, data in slot_groups.items():
-        filled = len(data["teams"])
-        status = "🔒 Closed" if data["closed"] else ("🟠 Full" if filled >= data["capacity"] else "🟢 Open")
-        embed.add_field(
-            name=f"Group {key} — {data['date']}",
-            value=f"{status} • {filled}/{data['capacity']} filled",
-            inline=False,
-        )
+    dj_roles[ctx.guild.id] = role.id
+    await ctx.send(f"DJ role set to {role.mention}. Only members with this role can use music commands.")
+
+
+def is_dj(ctx):
+    role_id = dj_roles.get(ctx.guild.id)
+    if not role_id:
+        return True
+    if ctx.author.guild_permissions.manage_guild:
+        return True
+    return any(r.id == role_id for r in ctx.author.roles)
+
+
+@bot.command(name="247")
+@commands.has_permissions(manage_guild=True)
+async def stay_in_vc(ctx, mode: str = None):
+    guild_id = ctx.guild.id
+    if mode is None:
+        state = "on" if stay_247.get(guild_id) else "off"
+        await ctx.send(f"24/7 mode is currently: **{state}**")
+        return
+    mode = mode.lower()
+    if mode not in ("on", "off"):
+        await ctx.send("Usage: `m247 on` or `m247 off`")
+        return
+    stay_247[guild_id] = (mode == "on")
+    await ctx.send(f"24/7 mode turned **{mode}**.")
+
+
+@bot.command(name="botchannel")
+@commands.has_permissions(manage_guild=True)
+async def botchannel(ctx, action: str = None, channel: discord.TextChannel = None):
+    guild_id = ctx.guild.id
+    allowed = bot_channels.setdefault(guild_id, set())
+
+    if action is None or action == "list":
+        if not allowed:
+            await ctx.send("No restricted channels set — commands work everywhere.")
+        else:
+            mentions = ", ".join(f"<#{cid}>" for cid in allowed)
+            await ctx.send(f"Bot commands are restricted to: {mentions}")
+        return
+
+    if action == "add":
+        if channel is None:
+            await ctx.send("Usage: `mbotchannel add #channel`")
+            return
+        allowed.add(channel.id)
+        await ctx.send(f"Bot commands are now allowed in {channel.mention}.")
+    elif action == "remove":
+        if channel is None:
+            await ctx.send("Usage: `mbotchannel remove #channel`")
+            return
+        allowed.discard(channel.id)
+        await ctx.send(f"Removed {channel.mention} from allowed channels.")
+    elif action == "clear":
+        allowed.clear()
+        await ctx.send("Cleared channel restrictions — commands work everywhere now.")
+    else:
+        await ctx.send("Usage: `mbotchannel add/remove/list/clear [#channel]`")
+
+
+def channel_allowed(ctx):
+    allowed = bot_channels.get(ctx.guild.id)
+    if not allowed:
+        return True
+    return ctx.channel.id in allowed
+
+
+@bot.group(name="aliases", invoke_without_command=True)
+async def aliases(ctx):
+    guild_aliases = command_aliases.get(ctx.guild.id, {})
+    if not guild_aliases:
+        await ctx.send("No custom aliases set.")
+        return
+    lines = "\n".join(f"`{a}` → `{c}`" for a, c in guild_aliases.items())
+    await ctx.send(f"**Custom Aliases:**\n{lines}")
+
+
+@aliases.command(name="set")
+@commands.has_permissions(manage_guild=True)
+async def aliases_set(ctx, alias: str, real_command: str):
+    if bot.get_command(real_command) is None:
+        await ctx.send(f"`{real_command}` is not a real command.")
+        return
+    command_aliases.setdefault(ctx.guild.id, {})[alias.lower()] = real_command.lower()
+    await ctx.send(f"Alias set: `{alias}` → `{real_command}`")
+
+
+@aliases.command(name="remove")
+@commands.has_permissions(manage_guild=True)
+async def aliases_remove(ctx, alias: str):
+    guild_aliases = command_aliases.get(ctx.guild.id, {})
+    if alias.lower() in guild_aliases:
+        del guild_aliases[alias.lower()]
+        await ctx.send(f"Removed alias `{alias}`.")
+    else:
+        await ctx.send("That alias doesn't exist.")
+
+
+@aliases.command(name="list")
+async def aliases_list(ctx):
+    await aliases(ctx)
+
+
+@aliases.command(name="clear")
+@commands.has_permissions(manage_guild=True)
+async def aliases_clear(ctx):
+    command_aliases.pop(ctx.guild.id, None)
+    await ctx.send("All aliases cleared.")
+
+
+@bot.group(name="settings", invoke_without_command=True)
+async def settings(ctx):
+    await settings_view(ctx)
+
+
+@settings.command(name="view")
+async def settings_view(ctx):
+    guild_id = ctx.guild.id
+    prefix = get_prefix(bot, ctx.message)
+    dj_role_obj = ctx.guild.get_role(dj_roles.get(guild_id)) if dj_roles.get(guild_id) else None
+    logs_channel_obj = ctx.guild.get_channel(logs_channels.get(guild_id)) if logs_channels.get(guild_id) else None
+
+    embed = discord.Embed(title="⚙️ Server Settings", color=discord.Color.blurple())
+    embed.add_field(name="Prefix", value=f"`{prefix}`", inline=True)
+    embed.add_field(name="Volume", value=f"{int(get_volume(guild_id) * 100)}%", inline=True)
+    embed.add_field(name="Bass Boost", value=str(get_bass(guild_id)), inline=True)
+    embed.add_field(name="Loop Mode", value=get_loop(guild_id), inline=True)
+    embed.add_field(name="Autoplay", value="on" if get_autoplay(guild_id) else "off", inline=True)
+    embed.add_field(name="24/7 Mode", value="on" if stay_247.get(guild_id) else "off", inline=True)
+    embed.add_field(name="DJ Role", value=dj_role_obj.mention if dj_role_obj else "None", inline=True)
+    embed.add_field(name="Logs Channel", value=logs_channel_obj.mention if logs_channel_obj else "None", inline=True)
+    allowed = bot_channels.get(guild_id)
+    embed.add_field(
+        name="Bot Channels",
+        value=", ".join(f"<#{c}>" for c in allowed) if allowed else "Everywhere",
+        inline=False,
+    )
     await ctx.send(embed=embed)
 
 
-@bot.command(name="forceslot")
+@settings.command(name="prefix")
+@commands.has_permissions(administrator=True)
+async def settings_prefix(ctx, new_prefix: str):
+    await setprefix(ctx, new_prefix)
+
+
+@settings.command(name="default_volume")
 @commands.has_permissions(manage_guild=True)
-async def forceslot(ctx, group_key: str, *, rest: str):
-    """Usage: mforceslot <group_key> <team_name> | <player ids>"""
-    data = slot_groups.get(group_key)
-    if not data:
-        await ctx.send("No group with that key.")
-        return
-    if "|" not in rest:
-        await ctx.send("Usage: `mforceslot <group_key> <team_name> | <player ids>`")
-        return
-    team_name, members = [p.strip() for p in rest.split("|", 1)]
-    team = {
-        "leader_id": ctx.author.id,
-        "team_name": team_name,
-        "members": members,
-        "channel_id": None,
-    }
-    data["teams"].append(team)
-    if data.get("message"):
-        try:
-            await data["message"].edit(embed=build_group_embed(group_key, data))
-        except Exception:
-            pass
-    await ctx.send(f"Force-added **{team_name}** to Group {group_key}.")
+async def settings_default_volume(ctx, level: int):
+    await volume(ctx, level)
 
 
-@bot.command(name="closegroup")
+@settings.command(name="autoplay")
 @commands.has_permissions(manage_guild=True)
-async def closegroup(ctx, group_key: str):
-    data = slot_groups.get(group_key)
-    if not data:
-        await ctx.send("No group with that key.")
+async def settings_autoplay(ctx, mode: str):
+    await autoplay(ctx, mode)
+
+
+@bot.command(name="voteskip")
+async def voteskip(ctx):
+    guild_id = ctx.guild.id
+    vc = ctx.voice_client
+    if not vc or not vc.is_playing():
+        await ctx.send("Nothing is playing right now.")
         return
-    data["closed"] = True
-    if data.get("message"):
-        try:
-            await data["message"].edit(embed=build_group_embed(group_key, data), view=None)
-        except Exception:
-            pass
-    await ctx.send(f"Group {group_key} registration closed.")
-
-
-@bot.command(name="deletegroup")
-@commands.has_permissions(manage_guild=True)
-async def deletegroup(ctx, group_key: str, delete_channels: str = "no"):
-    data = slot_groups.pop(group_key, None)
-    if not data:
-        await ctx.send("No group with that key.")
+    if ctx.author.voice is None or ctx.author.voice.channel != vc.channel:
+        await ctx.send("You need to be in the same voice channel to vote.")
         return
-    if delete_channels.lower() == "yes":
-        for team in data["teams"]:
-            if team.get("channel_id"):
-                channel = ctx.guild.get_channel(team["channel_id"])
-                if channel:
-                    try:
-                        await channel.delete(reason="Scrim group deleted")
-                    except Exception:
-                        pass
-    await ctx.send(f"Group {group_key} deleted.")
+    votes = voteskip_votes.setdefault(guild_id, set())
+    votes.add(ctx.author.id)
+    members_in_vc = [m for m in vc.channel.members if not m.bot]
+    needed = max(1, len(members_in_vc) // 2 + 1)
+    if len(votes) >= needed:
+        vc.stop()
+        votes.clear()
+        await ctx.send("✅ Vote passed — skipping!")
+    else:
+        await ctx.send(f"🗳️ Vote to skip: {len(votes)}/{needed}")
 
 
-@bot.command(name="teaminfo")
-async def teaminfo(ctx, *, query: str):
-    query = query.strip()
-    target_id = None
-    if ctx.message.mentions:
-        target_id = ctx.message.mentions[0].id
+MUSIC_COMMANDS = {
+    "play", "skip", "pause", "resume", "stop", "queue", "shuffle", "volume",
+    "bass", "loop", "autoplay", "seek", "forward", "rewind", "restart",
+    "previous", "nowplaying", "join", "leave", "voteskip",
+}
 
-    for key, data in slot_groups.items():
-        for team in data["teams"]:
-            if (target_id and team["leader_id"] == target_id) or team["team_name"].lower() == query.lower():
-                embed = discord.Embed(
-                    title=f"📇 {team['team_name']}",
-                    description=f"Group **{key}** — {data['name']}",
-                    color=discord.Color.blurple(),
-                )
-                embed.add_field(name="Leader", value=f"<@{team['leader_id']}>", inline=False)
-                embed.add_field(name="Player IDs", value=team["members"], inline=False)
-                await ctx.send(embed=embed)
-                return
-    await ctx.send("Couldn't find a team matching that name or mention.")
+
+@bot.check
+async def global_music_check(ctx):
+    if ctx.command and ctx.command.name in MUSIC_COMMANDS:
+        if not channel_allowed(ctx):
+            allowed = bot_channels.get(ctx.guild.id)
+            mentions = ", ".join(f"<#{c}>" for c in allowed)
+            await ctx.send(f"Please use music commands in: {mentions}")
+            return False
+        if not is_dj(ctx):
+            await ctx.send("You need the DJ role to use music commands.")
+            return False
+    return True
 
 
 @bot.command(name="ping")
@@ -1280,23 +1289,21 @@ async def custom_help(ctx):
     )
 
     embed.add_field(
-        name="⚔️ Scrims & Utility",
-        value=(
-            f"`{prefix}scrim <slots> <details>` — Quick scrim with Register/Unregister buttons\n"
-            f"`{prefix}ping` — Check bot latency"
-        ),
+        name="🛠️ Utility",
+        value=f"`{prefix}ping` — Check bot latency\n`{prefix}voteskip` — Vote to skip the current song",
         inline=False,
     )
 
     embed.add_field(
-        name="🏆 Tournament Slot System",
+        name="🔧 Admin & Config",
         value=(
-            f"`{prefix}createslot <key> <capacity> <date> <time info>` — Create a slot group (Admin)\n"
-            f"`{prefix}slots` — Show all slot groups\n"
-            f"`{prefix}forceslot <key> <team name> | <player ids>` — Force-add a team (Admin)\n"
-            f"`{prefix}closegroup <key>` — Close registration (Admin)\n"
-            f"`{prefix}deletegroup <key> [yes]` — Delete a group, optionally its team channels (Admin)\n"
-            f"`{prefix}teaminfo <team name or @leader>` — Look up a team's details"
+            f"`{prefix}setuplogs [#channel]` — Set the voice-activity/logs channel\n"
+            f"`{prefix}removelogs` — Disable logging\n"
+            f"`{prefix}dj role <@role>` — Restrict music commands to a DJ role\n"
+            f"`{prefix}247 on/off` — Stay in voice channel 24/7\n"
+            f"`{prefix}botchannel add/remove/list/clear [#channel]` — Restrict commands to channels\n"
+            f"`{prefix}aliases set/remove/list/clear <alias> <command>` — Custom command aliases\n"
+            f"`{prefix}settings view` — Show all current server settings"
         ),
         inline=False,
     )
