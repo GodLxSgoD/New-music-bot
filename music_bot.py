@@ -795,6 +795,328 @@ async def show_queue(ctx):
     await ctx.send(f"**Queue:**\n{msg}")
 
 
+# Active scrims: {message_id: {"slots": int, "description": str, "host_id": int, "host_name": str, "registered": [user_id]}}
+scrims = {}
+
+
+def build_scrim_embed(data):
+    embed = discord.Embed(
+        title="⚔️ Scrim",
+        description=data["description"],
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Slots", value=f"{len(data['registered'])}/{data['slots']}", inline=True)
+    if data["registered"]:
+        names = "\n".join(f"<@{uid}>" for uid in data["registered"])
+    else:
+        names = "No one registered yet."
+    embed.add_field(name="Registered", value=names, inline=False)
+    embed.set_footer(text=f"Hosted by {data['host_name']}")
+    return embed
+
+
+class ScrimView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Register", style=discord.ButtonStyle.success)
+    async def register_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = scrims.get(interaction.message.id)
+        if not data:
+            await interaction.response.send_message("This scrim is no longer active.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        if uid in data["registered"]:
+            await interaction.response.send_message("You're already registered.", ephemeral=True)
+            return
+        if len(data["registered"]) >= data["slots"]:
+            await interaction.response.send_message("This scrim is full.", ephemeral=True)
+            return
+        data["registered"].append(uid)
+        await interaction.response.edit_message(embed=build_scrim_embed(data), view=self)
+
+    @discord.ui.button(label="Unregister", style=discord.ButtonStyle.danger)
+    async def unregister_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = scrims.get(interaction.message.id)
+        if not data:
+            await interaction.response.send_message("This scrim is no longer active.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        if uid not in data["registered"]:
+            await interaction.response.send_message("You're not registered for this scrim.", ephemeral=True)
+            return
+        data["registered"].remove(uid)
+        await interaction.response.edit_message(embed=build_scrim_embed(data), view=self)
+
+    @discord.ui.button(label="Close Registration", style=discord.ButtonStyle.secondary)
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = scrims.get(interaction.message.id)
+        if not data:
+            await interaction.response.send_message("This scrim is no longer active.", ephemeral=True)
+            return
+        if interaction.user.id != data["host_id"] and not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Only the host or a moderator can close this scrim.", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        embed = build_scrim_embed(data)
+        embed.title = "⚔️ Scrim (Closed)"
+        scrims.pop(interaction.message.id, None)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@bot.command(name="scrim")
+async def scrim(ctx, slots: int, *, details: str):
+    if slots < 1 or slots > 50:
+        await ctx.send("Slots must be between 1 and 50.")
+        return
+    data = {
+        "slots": slots,
+        "description": details,
+        "host_id": ctx.author.id,
+        "host_name": str(ctx.author),
+        "registered": [],
+    }
+    embed = build_scrim_embed(data)
+    msg = await ctx.send(embed=embed, view=ScrimView())
+    scrims[msg.id] = data
+
+
+# ---------- SCRIM / TOURNAMENT SLOT SYSTEM ----------
+# slot_groups: {group_key: {"name":, "date":, "time_info":, "capacity":, "teams":[{leader_id, team_name, members, channel_id}], "closed": bool, "message": discord.Message}}
+slot_groups = {}
+
+
+def build_group_embed(key, data):
+    filled = len(data["teams"])
+    cap = data["capacity"]
+    bar = make_progress_bar(filled, cap, length=15)
+    status = "🔒 CLOSED" if data["closed"] else ("🟢 OPEN" if filled < cap else "🟠 FULL")
+    embed = discord.Embed(
+        title=f"⚡ {data['name']} — Group {key}",
+        description=f"📅 **{data['date']}**\n⏰ {data['time_info']}",
+        color=discord.Color.orange() if data["closed"] else discord.Color.green(),
+    )
+    embed.add_field(name="Status", value=status, inline=True)
+    embed.add_field(name="Slots", value=f"{filled}/{cap} filled\n{bar}", inline=False)
+    if data["teams"]:
+        team_list = "\n".join(f"• {t['team_name']}" for t in data["teams"])
+        embed.add_field(name="Registered Teams", value=team_list, inline=False)
+    embed.set_footer(text="Auto-updates on registration")
+    return embed
+
+
+class RegisterModal(discord.ui.Modal, title="Team Registration"):
+    team_name = discord.ui.TextInput(label="Team Name", placeholder="e.g. Team Alpha", max_length=50)
+    player_ids = discord.ui.TextInput(
+        label="Player IDs (one per line)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Player1 - 12345\nPlayer2 - 67890\n...",
+        max_length=500,
+    )
+
+    def __init__(self, group_key):
+        super().__init__()
+        self.group_key = group_key
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = slot_groups.get(self.group_key)
+        if not data or data["closed"]:
+            await interaction.response.send_message("Registration is closed for this group.", ephemeral=True)
+            return
+        if len(data["teams"]) >= data["capacity"]:
+            await interaction.response.send_message("This group is already full.", ephemeral=True)
+            return
+        if any(t["leader_id"] == interaction.user.id for t in data["teams"]):
+            await interaction.response.send_message("You've already registered a team in this group.", ephemeral=True)
+            return
+
+        team = {
+            "leader_id": interaction.user.id,
+            "team_name": self.team_name.value,
+            "members": self.player_ids.value,
+            "channel_id": None,
+        }
+        data["teams"].append(team)
+
+        if data.get("message"):
+            try:
+                await data["message"].edit(embed=build_group_embed(self.group_key, data))
+            except Exception:
+                pass
+
+        # Create a private team channel
+        guild = interaction.guild
+        try:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            }
+            channel = await guild.create_text_channel(
+                name=f"team-{self.team_name.value}"[:90],
+                overwrites=overwrites,
+                reason="Scrim team registration",
+            )
+            team["channel_id"] = channel.id
+            info_embed = discord.Embed(
+                title=f"✅ {self.team_name.value} — Confirmed",
+                description=f"Group **{self.group_key}** ({data['name']})",
+                color=discord.Color.green(),
+            )
+            info_embed.add_field(name="Leader", value=interaction.user.mention, inline=False)
+            info_embed.add_field(name="Player IDs", value=self.player_ids.value, inline=False)
+            await channel.send(embed=info_embed)
+        except discord.Forbidden:
+            pass
+
+        await interaction.response.send_message(
+            f"Registered **{self.team_name.value}** for Group {self.group_key}!", ephemeral=True
+        )
+
+
+class SlotGroupView(discord.ui.View):
+    def __init__(self, group_key):
+        super().__init__(timeout=None)
+        self.group_key = group_key
+
+    @discord.ui.button(label="⚡ Register Team", style=discord.ButtonStyle.success)
+    async def register_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = slot_groups.get(self.group_key)
+        if not data or data["closed"]:
+            await interaction.response.send_message("Registration is closed for this group.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RegisterModal(self.group_key))
+
+
+@bot.command(name="createslot")
+@commands.has_permissions(manage_guild=True)
+async def createslot(ctx, group_key: str, capacity: int, date: str, *, time_info: str):
+    if group_key in slot_groups:
+        await ctx.send("A group with that key already exists.")
+        return
+    data = {
+        "name": "Scrim Qualifiers",
+        "date": date,
+        "time_info": time_info,
+        "capacity": capacity,
+        "teams": [],
+        "closed": False,
+        "message": None,
+    }
+    slot_groups[group_key] = data
+    view = SlotGroupView(group_key)
+    msg = await ctx.send(embed=build_group_embed(group_key, data), view=view)
+    data["message"] = msg
+
+
+@bot.command(name="slots")
+async def slots(ctx):
+    if not slot_groups:
+        await ctx.send("No active slot groups right now.")
+        return
+    embed = discord.Embed(title="📋 Slot Groups Overview", color=discord.Color.blurple())
+    for key, data in slot_groups.items():
+        filled = len(data["teams"])
+        status = "🔒 Closed" if data["closed"] else ("🟠 Full" if filled >= data["capacity"] else "🟢 Open")
+        embed.add_field(
+            name=f"Group {key} — {data['date']}",
+            value=f"{status} • {filled}/{data['capacity']} filled",
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="forceslot")
+@commands.has_permissions(manage_guild=True)
+async def forceslot(ctx, group_key: str, *, rest: str):
+    """Usage: mforceslot <group_key> <team_name> | <player ids>"""
+    data = slot_groups.get(group_key)
+    if not data:
+        await ctx.send("No group with that key.")
+        return
+    if "|" not in rest:
+        await ctx.send("Usage: `mforceslot <group_key> <team_name> | <player ids>`")
+        return
+    team_name, members = [p.strip() for p in rest.split("|", 1)]
+    team = {
+        "leader_id": ctx.author.id,
+        "team_name": team_name,
+        "members": members,
+        "channel_id": None,
+    }
+    data["teams"].append(team)
+    if data.get("message"):
+        try:
+            await data["message"].edit(embed=build_group_embed(group_key, data))
+        except Exception:
+            pass
+    await ctx.send(f"Force-added **{team_name}** to Group {group_key}.")
+
+
+@bot.command(name="closegroup")
+@commands.has_permissions(manage_guild=True)
+async def closegroup(ctx, group_key: str):
+    data = slot_groups.get(group_key)
+    if not data:
+        await ctx.send("No group with that key.")
+        return
+    data["closed"] = True
+    if data.get("message"):
+        try:
+            await data["message"].edit(embed=build_group_embed(group_key, data), view=None)
+        except Exception:
+            pass
+    await ctx.send(f"Group {group_key} registration closed.")
+
+
+@bot.command(name="deletegroup")
+@commands.has_permissions(manage_guild=True)
+async def deletegroup(ctx, group_key: str, delete_channels: str = "no"):
+    data = slot_groups.pop(group_key, None)
+    if not data:
+        await ctx.send("No group with that key.")
+        return
+    if delete_channels.lower() == "yes":
+        for team in data["teams"]:
+            if team.get("channel_id"):
+                channel = ctx.guild.get_channel(team["channel_id"])
+                if channel:
+                    try:
+                        await channel.delete(reason="Scrim group deleted")
+                    except Exception:
+                        pass
+    await ctx.send(f"Group {group_key} deleted.")
+
+
+@bot.command(name="teaminfo")
+async def teaminfo(ctx, *, query: str):
+    query = query.strip()
+    target_id = None
+    if ctx.message.mentions:
+        target_id = ctx.message.mentions[0].id
+
+    for key, data in slot_groups.items():
+        for team in data["teams"]:
+            if (target_id and team["leader_id"] == target_id) or team["team_name"].lower() == query.lower():
+                embed = discord.Embed(
+                    title=f"📇 {team['team_name']}",
+                    description=f"Group **{key}** — {data['name']}",
+                    color=discord.Color.blurple(),
+                )
+                embed.add_field(name="Leader", value=f"<@{team['leader_id']}>", inline=False)
+                embed.add_field(name="Player IDs", value=team["members"], inline=False)
+                await ctx.send(embed=embed)
+                return
+    await ctx.send("Couldn't find a team matching that name or mention.")
+
+
+@bot.command(name="ping")
+async def ping(ctx):
+    latency_ms = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Latency: **{latency_ms}ms**")
+
+
 @bot.command(name="ban")
 @commands.has_permissions(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
@@ -953,6 +1275,28 @@ async def custom_help(ctx):
             f"`{prefix}clear <amount>` — Delete recent messages\n"
             f"`{prefix}sticky <message>` — Pin a repeating sticky message\n"
             f"`{prefix}stickyoff` — Remove the sticky message"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚔️ Scrims & Utility",
+        value=(
+            f"`{prefix}scrim <slots> <details>` — Quick scrim with Register/Unregister buttons\n"
+            f"`{prefix}ping` — Check bot latency"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🏆 Tournament Slot System",
+        value=(
+            f"`{prefix}createslot <key> <capacity> <date> <time info>` — Create a slot group (Admin)\n"
+            f"`{prefix}slots` — Show all slot groups\n"
+            f"`{prefix}forceslot <key> <team name> | <player ids>` — Force-add a team (Admin)\n"
+            f"`{prefix}closegroup <key>` — Close registration (Admin)\n"
+            f"`{prefix}deletegroup <key> [yes]` — Delete a group, optionally its team channels (Admin)\n"
+            f"`{prefix}teaminfo <team name or @leader>` — Look up a team's details"
         ),
         inline=False,
     )
