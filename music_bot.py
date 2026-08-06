@@ -1,5 +1,7 @@
 import asyncio
+import datetime
 import os
+import re
 import discord
 from discord.ext import commands
 import yt_dlp as youtube_dl
@@ -17,6 +19,7 @@ if not BOT_TOKEN:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 # Per-server custom prefix
 prefixes = {}
@@ -46,11 +49,17 @@ ytdl_format_options = {
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
-# SoundCloud fallback, jokhon YouTube block kore
+# SoundCloud fallback, when YouTube blocks
 sc_format_options = dict(ytdl_format_options)
 sc_format_options["default_search"] = "scsearch"
 sc_format_options.pop("extractor_args", None)
 ytdl_sc = youtube_dl.YoutubeDL(sc_format_options)
+
+# Used for Autoplay: fetches a YouTube "Mix"/radio playlist based on the last played video
+radio_format_options = dict(ytdl_format_options)
+radio_format_options["noplaylist"] = False
+radio_format_options["playlistend"] = 5
+ytdl_radio = youtube_dl.YoutubeDL(radio_format_options)
 
 # Per-server song queue
 queues = {}
@@ -64,6 +73,10 @@ now_playing = {}
 history = {}
 # Per-server loop mode: "off", "one", "queue"
 loop_modes = {}
+# Per-server autoplay toggle: True/False
+autoplay_flags = {}
+# Per-channel sticky message: {channel_id: {"content": str, "message": discord.Message}}
+sticky_messages = {}
 
 
 def get_queue(guild_id):
@@ -105,6 +118,10 @@ def get_loop(guild_id):
     return loop_modes[guild_id]
 
 
+def get_autoplay(guild_id):
+    return autoplay_flags.get(guild_id, False)
+
+
 class Song:
     def __init__(self, source_url, title, thumbnail=None, webpage_url=None, duration=0, source_name="YouTube"):
         self.source_url = source_url
@@ -137,6 +154,42 @@ async def search_song(query):
         duration=data.get("duration", 0),
         source_name=source_name,
     )
+
+
+def fetch_autoplay_song(last_song):
+    """Blocking call (safe to run on a background thread) that finds a related
+    YouTube song to the last one played, using YouTube's Mix/Radio playlist."""
+    if not last_song.webpage_url or "watch?v=" not in last_song.webpage_url:
+        return None
+    match = re.search(r"watch\?v=([\w-]+)", last_song.webpage_url)
+    if not match:
+        return None
+    video_id = match.group(1)
+    radio_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+    try:
+        data = ytdl_radio.extract_info(radio_url, download=False)
+    except Exception:
+        return None
+
+    entries = data.get("entries") or []
+    for entry in entries:
+        if not entry:
+            continue
+        if entry.get("id") == video_id:
+            continue  # skip the same song
+        try:
+            full = ytdl.extract_info(entry["url"], download=False)
+        except Exception:
+            continue
+        return Song(
+            full["url"],
+            full.get("title", "Unknown"),
+            thumbnail=full.get("thumbnail"),
+            webpage_url=full.get("webpage_url"),
+            duration=full.get("duration", 0),
+            source_name="YouTube (Autoplay)",
+        )
+    return None
 
 
 def format_time(seconds):
@@ -302,6 +355,15 @@ class MusicControls(discord.ui.View):
             await vc.disconnect()
         await interaction.response.send_message("Disconnected.", ephemeral=True)
 
+    @discord.ui.button(label="Autoplay: off", style=discord.ButtonStyle.secondary, row=2, emoji="♾️")
+    async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = self.ctx.guild.id
+        new_state = not get_autoplay(guild_id)
+        autoplay_flags[guild_id] = new_state
+        button.label = f"Autoplay: {'on' if new_state else 'off'}"
+        button.style = discord.ButtonStyle.success if new_state else discord.ButtonStyle.secondary
+        await interaction.response.edit_message(view=self)
+
 
 def get_elapsed(guild_id):
     import time
@@ -366,6 +428,12 @@ def play_song(ctx, song, seek_seconds=0):
             if mode == "queue":
                 get_queue(guild_id).append(song)
             get_history(guild_id).append(song)
+
+            if not get_queue(guild_id) and get_autoplay(guild_id):
+                next_song = fetch_autoplay_song(song)
+                if next_song:
+                    play_song(ctx, next_song, seek_seconds=0)
+                    return
             play_next(ctx)
 
     voice_client.play(source, after=after_play)
@@ -392,6 +460,41 @@ def play_next(ctx):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    channel_id = message.channel.id
+    if channel_id in sticky_messages:
+        old = sticky_messages[channel_id]
+        try:
+            await old["message"].delete()
+        except Exception:
+            pass
+        try:
+            new_msg = await message.channel.send(f"📌 {old['content']}")
+            sticky_messages[channel_id]["message"] = new_msg
+        except Exception:
+            pass
+
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You don't have permission to do that.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("Couldn't find that member.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing argument: `{error.param.name}`")
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    else:
+        print(f"Unhandled command error: {error}")
 
 
 @bot.command(name="setprefix")
@@ -639,6 +742,21 @@ async def loop(ctx, mode: str = None):
     await ctx.send(f"Loop mode set to: **{mode}**")
 
 
+@bot.command(name="autoplay")
+async def autoplay(ctx, mode: str = None):
+    guild_id = ctx.guild.id
+    if mode is None:
+        state = "on" if get_autoplay(guild_id) else "off"
+        await ctx.send(f"Autoplay is currently: **{state}**")
+        return
+    mode = mode.lower()
+    if mode not in ("on", "off"):
+        await ctx.send("Usage: `mautoplay on` or `mautoplay off`")
+        return
+    autoplay_flags[guild_id] = (mode == "on")
+    await ctx.send(f"Autoplay turned **{mode}**.")
+
+
 @bot.command(name="previous")
 async def previous(ctx):
     guild_id = ctx.guild.id
@@ -675,6 +793,89 @@ async def show_queue(ctx):
         return
     msg = "\n".join(f"{i+1}. {s.title}" for i, s in enumerate(queue))
     await ctx.send(f"**Queue:**\n{msg}")
+
+
+@bot.command(name="ban")
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.ban(reason=reason)
+    await ctx.send(f"🔨 Banned **{member}**. Reason: {reason}")
+
+
+@bot.command(name="unban")
+@commands.has_permissions(ban_members=True)
+async def unban(ctx, *, user: str):
+    banned = [entry async for entry in ctx.guild.bans()]
+    target = None
+    if user.isdigit():
+        target = discord.utils.find(lambda b: b.user.id == int(user), banned)
+    else:
+        target = discord.utils.find(lambda b: str(b.user) == user or b.user.name == user, banned)
+
+    if target is None:
+        await ctx.send("Couldn't find that user in the ban list.")
+        return
+
+    await ctx.guild.unban(target.user)
+    await ctx.send(f"✅ Unbanned **{target.user}**.")
+
+
+@bot.command(name="kick")
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.kick(reason=reason)
+    await ctx.send(f"👢 Kicked **{member}**. Reason: {reason}")
+
+
+@bot.command(name="timeout")
+@commands.has_permissions(moderate_members=True)
+async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason provided"):
+    duration = datetime.timedelta(minutes=minutes)
+    await member.timeout(duration, reason=reason)
+    await ctx.send(f"🔇 Timed out **{member}** for **{minutes} minute(s)**. Reason: {reason}")
+
+
+@bot.command(name="untimeout")
+@commands.has_permissions(moderate_members=True)
+async def untimeout(ctx, member: discord.Member):
+    await member.timeout(None)
+    await ctx.send(f"🔊 Removed timeout from **{member}**.")
+
+
+@bot.command(name="clear")
+@commands.has_permissions(manage_messages=True)
+async def clear(ctx, amount: int = 5):
+    deleted = await ctx.channel.purge(limit=amount + 1)
+    msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+
+@bot.command(name="sticky")
+@commands.has_permissions(manage_messages=True)
+async def sticky(ctx, *, content: str):
+    channel_id = ctx.channel.id
+    old = sticky_messages.get(channel_id)
+    if old and old.get("message"):
+        try:
+            await old["message"].delete()
+        except Exception:
+            pass
+    msg = await ctx.send(f"📌 {content}")
+    sticky_messages[channel_id] = {"content": content, "message": msg}
+
+
+@bot.command(name="stickyoff")
+@commands.has_permissions(manage_messages=True)
+async def stickyoff(ctx):
+    channel_id = ctx.channel.id
+    old = sticky_messages.pop(channel_id, None)
+    if old and old.get("message"):
+        try:
+            await old["message"].delete()
+        except Exception:
+            pass
+    await ctx.send("Sticky message removed.")
 
 
 @bot.command(name="help")
@@ -715,7 +916,8 @@ async def custom_help(ctx):
         value=(
             f"`{prefix}queue` — Show the current queue\n"
             f"`{prefix}shuffle` — Shuffle the queue\n"
-            f"`{prefix}loop [off/one/queue]` — Set loop mode"
+            f"`{prefix}loop [off/one/queue]` — Set loop mode\n"
+            f"`{prefix}autoplay [on/off]` — Auto-continue with related songs"
         ),
         inline=False,
     )
@@ -736,6 +938,21 @@ async def custom_help(ctx):
             f"`{prefix}leave` — Leave voice channel\n"
             f"`{prefix}nowplaying` — Show current song details\n"
             f"`{prefix}setprefix <new>` — Change prefix (Admin only)"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🛡️ Moderation",
+        value=(
+            f"`{prefix}ban @user [reason]` — Ban a member\n"
+            f"`{prefix}unban <username or ID>` — Unban a member\n"
+            f"`{prefix}kick @user [reason]` — Kick a member\n"
+            f"`{prefix}timeout @user <minutes> [reason]` — Timeout a member\n"
+            f"`{prefix}untimeout @user` — Remove a timeout\n"
+            f"`{prefix}clear <amount>` — Delete recent messages\n"
+            f"`{prefix}sticky <message>` — Pin a repeating sticky message\n"
+            f"`{prefix}stickyoff` — Remove the sticky message"
         ),
         inline=False,
     )
