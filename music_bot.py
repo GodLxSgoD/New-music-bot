@@ -69,15 +69,16 @@ def get_volume(guild_id):
 
 def get_bass(guild_id):
     if guild_id not in bass_levels:
-        bass_levels[guild_id] = 8
+        bass_levels[guild_id] = 3
     return bass_levels[guild_id]
 
 
 def get_ffmpeg_options(guild_id):
     bass = get_bass(guild_id)
+    audio_filter = f"bass=g={bass},dynaudnorm=f=150:g=15"
     return {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": f"-vn -b:a 320k -af bass=g={bass}",
+        "options": f"-vn -b:a 320k -af {audio_filter}",
     }
 
 
@@ -487,7 +488,7 @@ async def bass(ctx, level: int = None):
         return
 
     if level < 0 or level > 20:
-        await ctx.send("Bass level must be between 0 and 20 (default 8).")
+        await ctx.send("Bass level must be between 0 and 20 (default 3).")
         return
 
     bass_levels[guild_id] = level
