@@ -4,6 +4,8 @@ import os
 import re
 import discord
 import aiohttp
+import io
+from PIL import Image, ImageDraw, ImageFont
 from discord.ext import commands
 import yt_dlp as youtube_dl
 
@@ -666,6 +668,73 @@ async def on_voice_state_update(member, before, after):
         )
 
 
+async def generate_welcome_banner(member, background_url=None, title="WELCOME"):
+    width, height = 900, 300
+
+    if background_url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(background_url, timeout=10) as resp:
+                    bg_bytes = await resp.read()
+            bg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+            bg = bg.resize((width, height))
+        except Exception:
+            background_url = None
+
+    if not background_url:
+        bg = Image.new("RGB", (width, height))
+        top = (30, 30, 60)
+        bottom = (90, 40, 120)
+        for y in range(height):
+            ratio = y / height
+            r = int(top[0] + (bottom[0] - top[0]) * ratio)
+            g = int(top[1] + (bottom[1] - top[1]) * ratio)
+            b = int(top[2] + (bottom[2] - top[2]) * ratio)
+            ImageDraw.Draw(bg).line([(0, y), (width, y)], fill=(r, g, b))
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 90))
+    bg = Image.alpha_composite(bg.convert("RGBA"), overlay)
+
+    # Fetch and paste circular avatar
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(str(member.display_avatar.replace(size=256).url), timeout=10) as resp:
+                avatar_bytes = await resp.read()
+        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((160, 160))
+        mask = Image.new("L", (160, 160), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 160, 160), fill=255)
+        avatar_x, avatar_y = (width - 160) // 2, 30
+        # White ring border
+        ring = Image.new("RGBA", (172, 172), (0, 0, 0, 0))
+        ImageDraw.Draw(ring).ellipse((0, 0, 172, 172), fill=(255, 255, 255, 255))
+        bg.paste(ring, (avatar_x - 6, avatar_y - 6), ring)
+        bg.paste(avatar, (avatar_x, avatar_y), mask)
+    except Exception:
+        pass
+
+    draw = ImageDraw.Draw(bg)
+    try:
+        title_font = ImageFont.load_default(size=52)
+        name_font = ImageFont.load_default(size=32)
+    except TypeError:
+        title_font = ImageFont.load_default()
+        name_font = ImageFont.load_default()
+
+    title_bbox = draw.textbbox((0, 0), title, font=title_font)
+    title_w = title_bbox[2] - title_bbox[0]
+    draw.text(((width - title_w) / 2, 205), title, font=title_font, fill=(255, 255, 255, 255))
+
+    name_text = str(member)
+    name_bbox = draw.textbbox((0, 0), name_text, font=name_font)
+    name_w = name_bbox[2] - name_bbox[0]
+    draw.text(((width - name_w) / 2, 260), name_text, font=name_font, fill=(220, 220, 255, 255))
+
+    buffer = io.BytesIO()
+    bg.convert("RGB").save(buffer, format="PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename="welcome.png")
+
+
 DEFAULT_JOIN_MESSAGE = "👋 Welcome {mention} to **{server}**! We're now **{membercount}** members strong."
 DEFAULT_LEAVE_MESSAGE = "😢 **{user}** has left **{server}**. We're now **{membercount}** members."
 
@@ -686,17 +755,24 @@ async def on_member_join(member):
         membercount=member.guild.member_count,
     )
     try:
-        await channel.send(text)
+        banner = await generate_welcome_banner(member, background_url=config.get("background_url"), title="WELCOME")
+        await channel.send(content=text, file=banner)
     except Exception:
-        pass
+        try:
+            await channel.send(text)
+        except Exception:
+            pass
 
 
 @bot.event
 async def on_member_remove(member):
     config = welcome_config.get(member.guild.id)
-    if not config or not config.get("channel_id"):
+    if not config:
         return
-    channel = member.guild.get_channel(config["channel_id"])
+    channel_id = config.get("leave_channel_id") or config.get("channel_id")
+    if not channel_id:
+        return
+    channel = member.guild.get_channel(channel_id)
     if not channel:
         return
     template = config.get("leave_message", DEFAULT_LEAVE_MESSAGE)
@@ -1448,12 +1524,15 @@ async def global_music_check(ctx):
 async def welcome(ctx):
     config = welcome_config.get(ctx.guild.id, {})
     channel = ctx.guild.get_channel(config["channel_id"]) if config.get("channel_id") else None
+    leave_channel = ctx.guild.get_channel(config["leave_channel_id"]) if config.get("leave_channel_id") else channel
     await ctx.send(
-        f"**Welcome channel:** {channel.mention if channel else 'Not set'}\n"
+        f"**Welcome (join) channel:** {channel.mention if channel else 'Not set'}\n"
+        f"**Leave channel:** {leave_channel.mention if leave_channel else 'Not set'}\n"
         f"**Join message:** {config.get('join_message', DEFAULT_JOIN_MESSAGE)}\n"
         f"**Leave message:** {config.get('leave_message', DEFAULT_LEAVE_MESSAGE)}\n\n"
-        f"Use `mwelcome channel #channel`, `mwelcome message <text>`, "
-        f"`mwelcome leavemessage <text>`, `mwelcome test`\n"
+        f"Use `mwelcome channel #channel`, `mwelcome leavechannel #channel`, "
+        f"`mwelcome message <text>`, `mwelcome leavemessage <text>`, "
+        f"`mwelcome background <image url>`, `mwelcome test`\n"
         f"Placeholders: `{{mention}}` `{{user}}` `{{server}}` `{{membercount}}`"
     )
 
@@ -1498,7 +1577,29 @@ async def welcome_test(ctx):
         mention=ctx.author.mention, user=str(ctx.author),
         server=ctx.guild.name, membercount=ctx.guild.member_count,
     )
-    await ctx.send(f"**Preview:**\n{text}")
+    banner = await generate_welcome_banner(ctx.author, background_url=config.get("background_url"), title="WELCOME")
+    await ctx.send(content=f"**Preview:**\n{text}", file=banner)
+
+
+@welcome.command(name="leavechannel")
+@commands.has_permissions(manage_guild=True)
+async def welcome_leavechannel(ctx, channel: discord.TextChannel):
+    guild_id = ctx.guild.id
+    welcome_config.setdefault(guild_id, {})["leave_channel_id"] = channel.id
+    await ctx.send(f"✅ Leave messages will now be sent in {channel.mention} (separate from the welcome channel).")
+
+
+@welcome.command(name="background")
+@commands.has_permissions(manage_guild=True)
+async def welcome_background(ctx, url: str = None):
+    guild_id = ctx.guild.id
+    config = welcome_config.setdefault(guild_id, {})
+    if url is None:
+        config.pop("background_url", None)
+        await ctx.send("Background reset to the default gradient.")
+        return
+    config["background_url"] = url
+    await ctx.send("✅ Welcome banner background image updated.")
 
 
 @bot.command(name="level", aliases=["rank"])
@@ -1908,9 +2009,11 @@ HELP_CATEGORIES = {
         "emoji": "🎉",
         "commands": lambda p: (
             f"`{p}welcome channel #channel` — Set + lock the welcome channel (Admin)\n"
+            f"`{p}welcome leavechannel #channel` — Set a separate leave channel (Admin)\n"
             f"`{p}welcome message <text>` — Set the join message (Admin)\n"
             f"`{p}welcome leavemessage <text>` — Set the leave message (Admin)\n"
-            f"`{p}welcome test` — Preview the join message\n"
+            f"`{p}welcome background <image url>` — Set the welcome banner background (Admin)\n"
+            f"`{p}welcome test` — Preview the join message + banner\n"
             f"`{p}level [@user]` (`{p}rank`) — Show a level & XP progress\n"
             f"`{p}leaderboard` (`{p}lb`) — Top members by XP\n"
             f"`{p}setlevelchannel #channel` — Set level-up announcement channel (Admin)"
