@@ -751,44 +751,48 @@ async def generate_welcome_banner(member, background_url=None, title="WELCOME"):
         except Exception:
             src_img = None
 
-    # Fetch avatar once — reused on every frame if the background is animated
+    # Fetch avatar once — reused on every frame if the background is animated.
+    # Small badge in the top-right corner instead of a big centered circle,
+    # so the background (especially an animated gif) stays clean and visible.
+    AVATAR_SIZE = 84
     avatar, mask, ring = None, None, None
-    avatar_x, avatar_y = (width - 160) // 2, 30
+    avatar_x = width - AVATAR_SIZE - 24
+    avatar_y = 24
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(str(member.display_avatar.replace(size=256).url), timeout=10) as resp:
                 avatar_bytes = await resp.read()
-        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((160, 160))
-        mask = Image.new("L", (160, 160), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, 160, 160), fill=255)
-        ring = Image.new("RGBA", (172, 172), (0, 0, 0, 0))
-        ImageDraw.Draw(ring).ellipse((0, 0, 172, 172), fill=(255, 255, 255, 255))
+        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((AVATAR_SIZE, AVATAR_SIZE))
+        mask = Image.new("L", (AVATAR_SIZE, AVATAR_SIZE), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, AVATAR_SIZE, AVATAR_SIZE), fill=255)
+        ring_size = AVATAR_SIZE + 8
+        ring = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
+        ImageDraw.Draw(ring).ellipse((0, 0, ring_size, ring_size), fill=(255, 255, 255, 255))
     except Exception:
         avatar = None
 
     try:
         title_font = ImageFont.load_default(size=52)
-        name_font = ImageFont.load_default(size=32)
     except TypeError:
         title_font = ImageFont.load_default()
-        name_font = ImageFont.load_default()
-
-    name_text = str(member)
 
     def compose_frame(base_rgb):
         frame = base_rgb.convert("RGB").resize((width, height)).convert("RGBA")
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 90))
+        # Light tint only — enough for the white title text to stay readable
+        # without washing out the background gif/image.
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 55))
         frame = Image.alpha_composite(frame, overlay)
         if avatar is not None:
-            frame.paste(ring, (avatar_x - 6, avatar_y - 6), ring)
+            frame.paste(ring, (avatar_x - 4, avatar_y - 4), ring)
             frame.paste(avatar, (avatar_x, avatar_y), mask)
         draw = ImageDraw.Draw(frame)
         title_bbox = draw.textbbox((0, 0), title, font=title_font)
         title_w = title_bbox[2] - title_bbox[0]
-        draw.text(((width - title_w) / 2, 205), title, font=title_font, fill=(255, 255, 255, 255))
-        name_bbox = draw.textbbox((0, 0), name_text, font=name_font)
-        name_w = name_bbox[2] - name_bbox[0]
-        draw.text(((width - name_w) / 2, 260), name_text, font=name_font, fill=(220, 220, 255, 255))
+        title_h = title_bbox[3] - title_bbox[1]
+        draw.text(
+            ((width - title_w) / 2, (height - title_h) / 2 - title_bbox[1]),
+            title, font=title_font, fill=(255, 255, 255, 255),
+        )
         return frame.convert("RGB")
 
     if is_animated:
