@@ -1,7 +1,9 @@
 import asyncio
 import datetime
 import os
+import random
 import re
+import time
 import discord
 import aiohttp
 import io
@@ -65,6 +67,12 @@ radio_format_options["noplaylist"] = False
 radio_format_options["playlistend"] = 5
 radio_format_options["extract_flat"] = "in_playlist"
 ytdl_radio = youtube_dl.YoutubeDL(radio_format_options)
+
+# Dedicated instance for the `search` command (top-5 results, no auto-download)
+search_format_options = dict(ytdl_format_options)
+search_format_options["default_search"] = "ytsearch5"
+search_format_options.pop("extractor_args", None)
+ytdl_search = youtube_dl.YoutubeDL(search_format_options)
 
 # Per-server song queue
 queues = {}
@@ -142,7 +150,8 @@ def get_ffmpeg_options(guild_id):
     if extra:
         audio_filter += f",{extra}"
     return {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        # -nostdin avoids a known ffmpeg hang where it waits on stdin input
+        "before_options": "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         "options": f"-vn -b:a 320k -af {audio_filter}",
     }
 
@@ -263,6 +272,17 @@ class SeekModal(discord.ui.Modal, title="Jump to a position in the song"):
         super().__init__()
         self.ctx = ctx
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"SeekModal error: {error}")
+        message = "⚠️ Something went wrong seeking that song — please try again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            pass
+
     async def on_submit(self, interaction: discord.Interaction):
         guild_id = self.ctx.guild.id
         info = now_playing.get(guild_id)
@@ -303,6 +323,19 @@ class MusicControls(discord.ui.View):
         super().__init__(timeout=None)
         self.ctx = ctx
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        # Without this, any exception here just times out silently and Discord
+        # shows the generic "This interaction failed" with no explanation.
+        print(f"MusicControls error on {item}: {error}")
+        message = "⚠️ Something went wrong with that button — please try again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            pass
+
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=0)
     async def previous_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.ctx.guild.id
@@ -317,38 +350,47 @@ class MusicControls(discord.ui.View):
             now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
-            vc.stop()
+            try:
+                vc.stop()
+            except discord.ClientException:
+                pass
         play_song(self.ctx, prev_song, seek_seconds=0)
         await interaction.response.send_message("Playing previous song.", ephemeral=True)
 
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, row=0)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = self.ctx.voice_client
-        if vc and vc.is_playing():
-            vc.pause()
-            button.label = "Resume"
-            button.style = discord.ButtonStyle.success
-            await interaction.response.edit_message(view=self)
-        elif vc and vc.is_paused():
-            vc.resume()
-            button.label = "Pause"
-            button.style = discord.ButtonStyle.secondary
-            await interaction.response.edit_message(view=self)
-        else:
+        try:
+            if vc and vc.is_playing():
+                vc.pause()
+                button.label = "Resume"
+                button.style = discord.ButtonStyle.success
+                await interaction.response.edit_message(view=self)
+            elif vc and vc.is_paused():
+                vc.resume()
+                button.label = "Pause"
+                button.style = discord.ButtonStyle.secondary
+                await interaction.response.edit_message(view=self)
+            else:
+                await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+        except discord.ClientException:
+            # Happens if the song ended in the split-second between the click and the response
             await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, row=0)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = self.ctx.voice_client
-        if vc and vc.is_playing():
-            vc.stop()
-            await interaction.response.send_message("Skipped.", ephemeral=True)
-        else:
+        try:
+            if vc and vc.is_playing():
+                vc.stop()
+                await interaction.response.send_message("Skipped.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+        except discord.ClientException:
             await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, row=1)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        import random
         queue = get_queue(self.ctx.guild.id)
         if not queue:
             await interaction.response.send_message("The queue is empty.", ephemeral=True)
@@ -380,7 +422,10 @@ class MusicControls(discord.ui.View):
             now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
-            vc.stop()
+            try:
+                vc.stop()
+            except discord.ClientException:
+                pass
         await interaction.response.send_message("Stopped and cleared the queue.", ephemeral=True)
 
     @discord.ui.button(label="Disconnect", style=discord.ButtonStyle.danger, row=2)
@@ -391,7 +436,10 @@ class MusicControls(discord.ui.View):
             now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
-            await vc.disconnect()
+            try:
+                await vc.disconnect()
+            except discord.ClientException:
+                pass
         await interaction.response.send_message("Disconnected.", ephemeral=True)
 
     @discord.ui.button(label="Autoplay: off", style=discord.ButtonStyle.secondary, row=2, emoji="♾️")
@@ -405,7 +453,6 @@ class MusicControls(discord.ui.View):
 
 
 def get_elapsed(guild_id):
-    import time
     info = now_playing.get(guild_id)
     if not info:
         return 0
@@ -435,7 +482,6 @@ def build_now_playing_embed(guild_id, song, elapsed=0):
 
 def play_song(ctx, song, seek_seconds=0):
     """Play a specific song from a specific position (seconds)."""
-    import time
     guild_id = ctx.guild.id
     voice_client = ctx.voice_client
     opts = get_ffmpeg_options(guild_id)
@@ -527,7 +573,6 @@ async def on_message(message):
 
     # Chat XP (with cooldown to prevent spam-farming)
     if message.guild:
-        import random
         key = (message.guild.id, message.author.id)
         now_ts = datetime.datetime.utcnow().timestamp()
         if now_ts - last_xp_time.get(key, 0) >= 60:
@@ -549,6 +594,14 @@ async def on_command_error(ctx, error):
         await ctx.send(f"Missing argument: `{error.param.name}`")
     elif isinstance(error, commands.CommandNotFound):
         pass
+    elif isinstance(error, commands.CheckFailure):
+        pass  # already messaged by the failing check (e.g. global_music_check)
+    elif isinstance(error, commands.CommandInvokeError):
+        print(f"Unhandled command error in '{ctx.command}': {error.original}")
+        try:
+            await ctx.send("⚠️ Something went wrong running that command. It's been logged.")
+        except Exception:
+            pass
     else:
         print(f"Unhandled command error: {error}")
 
@@ -647,6 +700,9 @@ async def on_voice_state_update(member, before, after):
         )
 
 
+MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MB cap so a huge/bad link can't stall or blow up memory
+
+
 async def fetch_image_bytes(url):
     """Download a URL and return image bytes only if it's actually an image.
     Returns (bytes_or_none, error_message_or_none)."""
@@ -656,14 +712,21 @@ async def fetch_image_bytes(url):
                 if resp.status != 200:
                     return None, f"That link returned an error (HTTP {resp.status})."
                 content_type = resp.headers.get("Content-Type", "")
-                data = await resp.read()
                 if "image" not in content_type:
                     return None, (
                         "That doesn't look like a direct image link (I got a webpage, not an image). "
                         "Right-click the image itself and choose **Copy Image Address** — "
                         "Tenor page links and pin.it share links won't work."
                     )
-                return data, None
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                    return None, "That image is too large (max 15 MB). Please use a smaller file."
+                chunks = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    chunks.extend(chunk)
+                    if len(chunks) > MAX_IMAGE_BYTES:
+                        return None, "That image is too large (max 15 MB). Please use a smaller file."
+                return bytes(chunks), None
     except Exception:
         return None, "I couldn't reach that link at all — please double check it."
 
@@ -1118,7 +1181,6 @@ async def previous(ctx):
 
 @bot.command(name="shuffle")
 async def shuffle(ctx):
-    import random
     queue = get_queue(ctx.guild.id)
     if not queue:
         await ctx.send("The queue is empty, nothing to shuffle.")
@@ -1171,12 +1233,8 @@ async def clearqueue(ctx):
 @bot.command(name="search")
 async def search_cmd(ctx, *, query: str):
     loop = asyncio.get_event_loop()
-    search_opts = dict(ytdl_format_options)
-    search_opts["default_search"] = "ytsearch5"
-    search_opts.pop("extractor_args", None)
-    searcher = youtube_dl.YoutubeDL(search_opts)
     try:
-        data = await loop.run_in_executor(None, lambda: searcher.extract_info(query, download=False))
+        data = await loop.run_in_executor(None, lambda: ytdl_search.extract_info(query, download=False))
     except Exception as e:
         await ctx.send(f"Search failed: {e}")
         return
@@ -1524,6 +1582,8 @@ MUSIC_COMMANDS = {
 
 @bot.check
 async def global_music_check(ctx):
+    if ctx.guild is None:
+        return True  # ignore DMs — DJ role / channel checks need guild context
     if ctx.command and ctx.command.name in MUSIC_COMMANDS:
         if not channel_allowed(ctx):
             allowed = bot_channels.get(ctx.guild.id)
