@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import datetime
+import json
 import os
 import random
 import re
@@ -14,6 +16,7 @@ import yt_dlp as youtube_dl
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DEFAULT_PREFIX = "m"
+PREMIUM_FILE = os.environ.get("PREMIUM_FILE", "premium_guilds.json")
 # -----------------------------
 
 if not BOT_TOKEN:
@@ -78,7 +81,7 @@ ytdl_search = youtube_dl.YoutubeDL(search_format_options)
 queues = {}
 # Per-server volume level (default 0.5 = 50%)
 volumes = {}
-# Per-server bass boost level (default 3)
+# Per-server bass boost level. 0 = neutral/maximum source fidelity.
 bass_levels = {}
 # Tracks what's currently playing per server
 now_playing = {}
@@ -112,8 +115,59 @@ bot_channels = {}
 command_aliases = {}
 # Per-guild active vote-skip votes: {guild_id: set(user_id)}
 voteskip_votes = {}
-# Background tasks used by playback callbacks (one per guild).
-playback_tasks = {}
+
+# ---------- PREMIUM SYSTEM ----------
+# Persistent server-level premium grants. Example: {"123456789": {"expires_at": null}}
+premium_guilds = {}
+
+def load_premium_data():
+    global premium_guilds
+    try:
+        with open(PREMIUM_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        premium_guilds = data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        premium_guilds = {}
+
+def save_premium_data():
+    tmp = PREMIUM_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(premium_guilds, f, indent=2)
+        os.replace(tmp, PREMIUM_FILE)
+    except OSError as e:
+        print(f"Premium data save error: {e}")
+
+def premium_active(guild_id):
+    entry = premium_guilds.get(str(guild_id))
+    if not entry:
+        return False
+    expires_at = entry.get("expires_at")
+    if not expires_at:
+        return True
+    try:
+        if datetime.datetime.now(datetime.timezone.utc).timestamp() >= float(expires_at):
+            premium_guilds.pop(str(guild_id), None)
+            save_premium_data()
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+def premium_status_text(guild_id):
+    if not premium_active(guild_id):
+        return "🔒 Free"
+    entry = premium_guilds.get(str(guild_id), {})
+    expires_at = entry.get("expires_at")
+    if not expires_at:
+        return "💎 Premium • Lifetime"
+    remaining = max(0, int(float(expires_at) - datetime.datetime.now(datetime.timezone.utc).timestamp()))
+    return f"💎 Premium • {format_time(remaining)} remaining"
+
+def premium_required(guild_id):
+    return premium_active(guild_id)
+
+load_premium_data()
 
 
 def get_queue(guild_id):
@@ -129,32 +183,43 @@ def get_volume(guild_id):
 
 
 def get_bass(guild_id):
-    if guild_id not in bass_levels:
-        bass_levels[guild_id] = 3
-    return bass_levels[guild_id]
+    # Neutral by default: do not alter the original track unless the user
+    # explicitly enables a filter. This gives the cleanest possible output.
+    return bass_levels.setdefault(guild_id, 0)
 
 
-# Per-guild active special filter (nightcore/vaporwave/8d/karaoke/treble), None = off
+# Optional DSP filters. No filter is active by default.
+# These are intentionally moderate to reduce clipping/distortion.
 active_filters = {}
 FILTER_PRESETS = {
     "nightcore": "asetrate=48000*1.25,aresample=48000",
-    "vaporwave": "asetrate=48000*0.8,aresample=48000",
+    "vaporwave": "asetrate=48000*0.80,aresample=48000",
     "8d": "apulsator=hz=0.08",
     "karaoke": "pan=stereo|c0=c0-c1|c1=c1-c0",
-    "treble": "treble=g=5",
+    "treble": "treble=g=3",
 }
 
 
 def get_ffmpeg_options(guild_id):
+    # Discord voice ultimately receives 48 kHz PCM before its Opus encoder.
+    # Avoid -b:a here: FFmpegPCMAudio outputs PCM, so an audio bitrate flag is
+    # unnecessary and can be misleading. Keep the source neutral and clean.
+    filters = []
     bass = get_bass(guild_id)
-    audio_filter = f"bass=g={bass}"
+    if bass > 0:
+        filters.append(f"bass=g={bass}:width_type=h:width=100")
     extra = FILTER_PRESETS.get(active_filters.get(guild_id))
     if extra:
-        audio_filter += f",{extra}"
+        filters.append(extra)
+
+    options = "-vn -ar 48000 -ac 2 -sample_fmt s16"
+    if filters:
+        options += " -af " + ",".join(filters)
+
     return {
-        # -nostdin avoids a known ffmpeg hang where it waits on stdin input
+        # Stable HTTP reconnects + explicit 48 kHz stereo PCM for Discord voice.
         "before_options": "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": f"-vn -b:a 320k -af {audio_filter}",
+        "options": options,
     }
 
 
@@ -185,12 +250,17 @@ class Song:
 
 
 async def search_song(query):
+    loop = asyncio.get_event_loop()
     source_name = "YouTube"
     try:
-        data = await asyncio.to_thread(ytdl.extract_info, query, download=False)
+        data = await loop.run_in_executor(
+            None, lambda: ytdl.extract_info(query, download=False)
+        )
     except Exception:
         source_name = "SoundCloud"
-        data = await asyncio.to_thread(ytdl_sc.extract_info, query, download=False)
+        data = await loop.run_in_executor(
+            None, lambda: ytdl_sc.extract_info(query, download=False)
+        )
     if "entries" in data:
         data = data["entries"][0]
     return Song(
@@ -249,26 +319,11 @@ def format_time(seconds):
 
 
 def parse_time(text):
-    """Parse seconds, mm:ss, or hh:mm:ss into a non-negative integer."""
-    text = str(text).strip()
-    if not text:
-        raise ValueError("empty time")
-
     parts = text.split(":")
-    if len(parts) > 3:
-        raise ValueError("too many time components")
-
-    try:
-        values = [int(p) for p in parts]
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid time") from exc
-
-    if any(value < 0 for value in values):
-        raise ValueError("negative time")
-
+    parts = [int(p) for p in parts]
     seconds = 0
-    for value in values:
-        seconds = seconds * 60 + value
+    for p in parts:
+        seconds = seconds * 60 + p
     return seconds
 
 
@@ -359,6 +414,7 @@ class MusicControls(discord.ui.View):
         current = now_playing.get(guild_id)
         if current:
             get_queue(guild_id).insert(0, current["song"])
+            now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
             try:
@@ -429,8 +485,8 @@ class MusicControls(discord.ui.View):
         guild_id = self.ctx.guild.id
         queue = get_queue(guild_id)
         queue.clear()
-        now_playing.pop(guild_id, None)
-        voteskip_votes.pop(guild_id, None)
+        if guild_id in now_playing:
+            now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
             try:
@@ -443,8 +499,8 @@ class MusicControls(discord.ui.View):
     async def disconnect_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.ctx.guild.id
         get_queue(guild_id).clear()
-        now_playing.pop(guild_id, None)
-        voteskip_votes.pop(guild_id, None)
+        if guild_id in now_playing:
+            now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
             try:
@@ -491,137 +547,59 @@ def build_now_playing_embed(guild_id, song, elapsed=0):
     return embed
 
 
-async def _handle_playback_finished(ctx, song, playback_token, error):
-    """Handle FFmpeg completion without blocking Discord's audio callback thread."""
-    guild_id = ctx.guild.id
-    info = now_playing.get(guild_id)
-
-    # Ignore stale callbacks from a song that was manually stopped/restarted.
-    if not info or info.get("playback_token") is not playback_token:
-        return
-
-    if error:
-        print(f"Playback error in guild {guild_id}: {error}")
-
-    mode = get_loop(guild_id)
-    if mode == "one":
-        play_song(ctx, song, seek_seconds=0)
-        return
-
-    if mode == "queue":
-        get_queue(guild_id).append(song)
-
-    get_history(guild_id).append(song)
-
-    if not get_queue(guild_id) and get_autoplay(guild_id):
-        # yt-dlp is blocking; never run it on the audio callback thread.
-        try:
-            next_song = await asyncio.to_thread(fetch_autoplay_song, song)
-        except Exception as exc:
-            print(f"Autoplay lookup failed in guild {guild_id}: {exc}")
-            next_song = None
-
-        # The user may have pressed stop/seek while autoplay was searching.
-        current = now_playing.get(guild_id)
-        if current and current.get("playback_token") is playback_token:
-            if next_song:
-                play_song(ctx, next_song, seek_seconds=0)
-                return
-
-    current = now_playing.get(guild_id)
-    if current and current.get("playback_token") is playback_token:
-        # Mark the old playback as finished before advancing.
-        current["finished"] = True
-        play_next(ctx)
-
-
 def play_song(ctx, song, seek_seconds=0):
     """Play a specific song from a specific position (seconds)."""
     guild_id = ctx.guild.id
     voice_client = ctx.voice_client
-    if voice_client is None or not voice_client.is_connected():
-        return
-
-    seek_seconds = max(0, int(seek_seconds))
     opts = get_ffmpeg_options(guild_id)
     if seek_seconds > 0:
         opts = dict(opts)
         opts["before_options"] = f"-ss {seek_seconds} " + opts["before_options"]
-
-    try:
-        raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
-        source = discord.PCMVolumeTransformer(
-            raw_source, volume=get_volume(guild_id)
-        )
-    except Exception as exc:
-        print(f"Failed to create FFmpeg source for '{song.title}': {exc}")
-        # Advance to the next queued item instead of leaving the queue stuck.
-        if get_queue(guild_id):
-            play_next(ctx)
-        return
-
-    # A unique token makes old FFmpeg callbacks harmless after skip/seek/restart.
-    playback_token = object()
+    raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
+    source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
     now_playing[guild_id] = {
         "song": song,
         "started_at": time.time(),
         "seek_offset": seek_seconds,
-        "playback_token": playback_token,
-        "finished": False,
     }
     voteskip_votes.pop(guild_id, None)
 
     def after_play(error):
-        # This callback runs on discord.py's audio thread. Keep it tiny.
-        future = asyncio.run_coroutine_threadsafe(
-            _handle_playback_finished(ctx, song, playback_token, error),
-            bot.loop,
-        )
-        playback_tasks[guild_id] = future
+        if error:
+            print(f"Playback error: {error}")
+        if now_playing.get(guild_id, {}).get("song") is song and not now_playing[guild_id].get("manual_stop"):
+            mode = get_loop(guild_id)
+            if mode == "one":
+                play_song(ctx, song, seek_seconds=0)
+                return
+            if mode == "queue":
+                get_queue(guild_id).append(song)
+            get_history(guild_id).append(song)
+            if not get_queue(guild_id) and get_autoplay(guild_id):
+                next_song = fetch_autoplay_song(song)
+                if next_song:
+                    play_song(ctx, next_song, seek_seconds=0)
+                    return
+            play_next(ctx)
 
-    try:
-        voice_client.play(source, after=after_play)
-    except (discord.ClientException, RuntimeError) as exc:
-        print(f"Failed to start playback in guild {guild_id}: {exc}")
-        info = now_playing.get(guild_id)
-        if info and info.get("playback_token") is playback_token:
-            now_playing.pop(guild_id, None)
-        return
-
+    voice_client.play(source, after=after_play)
     embed = build_now_playing_embed(guild_id, song, elapsed=seek_seconds)
     view = MusicControls(ctx)
-
-    async def announce():
-        try:
-            await ctx.send(embed=embed, view=view)
-        except discord.HTTPException as exc:
-            print(f"Failed to send now-playing message: {exc}")
-
-        try:
-            channel_name = voice_client.channel.name if voice_client.channel else "voice channel"
-            await send_log(
-                ctx.guild,
-                f"🎵 **{ctx.author}** is now playing **{song.title}** in **{channel_name}**",
-            )
-        except Exception as exc:
-            print(f"Failed to send playback log: {exc}")
-
-    asyncio.run_coroutine_threadsafe(announce(), bot.loop)
+    asyncio.run_coroutine_threadsafe(
+        ctx.send(embed=embed, view=view), bot.loop
+    )
+    asyncio.run_coroutine_threadsafe(
+        send_log(ctx.guild, f"🎵 **{ctx.author}** is now playing **{song.title}** in **{voice_client.channel.name}**"),
+        bot.loop,
+    )
 
 
 def play_next(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
     voice_client = ctx.voice_client
-
-    if voice_client is None or not voice_client.is_connected():
+    if not queue or voice_client is None:
         return
-    if voice_client.is_playing() or voice_client.is_paused():
-        return
-    if not queue:
-        now_playing.pop(guild_id, None)
-        return
-
     song = queue.pop(0)
     play_song(ctx, song, seek_seconds=0)
 
@@ -1001,6 +979,7 @@ async def seek(ctx, position: str):
         return
     if seconds < 0:
         seconds = 0
+    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=seconds)
 
@@ -1013,6 +992,7 @@ async def restart(ctx):
         await ctx.send("Nothing is playing right now.")
         return
     song = info["song"]
+    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=0)
 
@@ -1028,6 +1008,7 @@ async def forward(ctx, seconds: int = 10):
     song = info["song"]
     if song.duration and new_pos > song.duration:
         new_pos = song.duration
+    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=new_pos)
 
@@ -1043,6 +1024,7 @@ async def rewind(ctx, seconds: int = 10):
     if new_pos < 0:
         new_pos = 0
     song = info["song"]
+    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=new_pos)
 
@@ -1084,7 +1066,7 @@ async def play(ctx, *, query: str):
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
     await ctx.send(embed=embed)
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+    if not ctx.voice_client.is_playing():
         play_next(ctx)
 
 
@@ -1116,21 +1098,18 @@ async def stop(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
     queue.clear()
+    if guild_id in now_playing:
+        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
-        try:
-            ctx.voice_client.stop()
-        except discord.ClientException:
-            pass
-    now_playing.pop(guild_id, None)
-    voteskip_votes.pop(guild_id, None)
+        ctx.voice_client.stop()
     await ctx.send("Stopped and cleared the queue.")
 
 
 @bot.command(name="leave", aliases=["disconnect"])
 async def leave(ctx):
     guild_id = ctx.guild.id
-    now_playing.pop(guild_id, None)
-    voteskip_votes.pop(guild_id, None)
+    if guild_id in now_playing:
+        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         channel_name = ctx.voice_client.channel.name
         await ctx.voice_client.disconnect()
@@ -1154,27 +1133,62 @@ async def bass(ctx, level: int = None):
 @bot.command(name="filter")
 async def filter_cmd(ctx, name: str = None):
     guild_id = ctx.guild.id
-    valid = list(FILTER_PRESETS.keys()) + ["bassboost", "clear"]
+    if not premium_required(guild_id):
+        await ctx.send("💎 **Premium feature:** audio filters are available only on Premium servers. Use `mpremium` to check your plan.")
+        return
+    valid = list(FILTER_PRESETS.keys()) + ["bassboost", "clear", "off"]
     if name is None:
         current = active_filters.get(guild_id, "none")
-        await ctx.send(f"Current filter: **{current}**\nAvailable: {', '.join(valid)}")
+        bass = get_bass(guild_id)
+        await ctx.send(
+            f"🎚 **Audio DSP**\n"
+            f"Filter: **{current}**\n"
+            f"Bass: **{bass} dB**\n"
+            f"Available: `{', '.join(valid)}`\n"
+            f"Use `{get_prefix(bot, ctx.message)}filter clear` to return to clean/neutral audio."
+        )
         return
-    name = name.lower()
-    if name == "clear":
+
+    name = name.lower().strip()
+    if name in ("clear", "off", "none"):
         active_filters.pop(guild_id, None)
-        bass_levels[guild_id] = 3
-        await ctx.send("Filters cleared — applies from the next song.")
+        bass_levels[guild_id] = 0
+        await ctx.send("🧼 All audio filters removed. Clean/neutral audio will be used on the next song.")
         return
+
     if name == "bassboost":
-        bass_levels[guild_id] = 12
+        bass_levels[guild_id] = 8
         active_filters.pop(guild_id, None)
-        await ctx.send("🔊 Bass boost filter applied — applies from the next song.")
+        await ctx.send("🔊 Bass boost set to **+8 dB**. It will apply from the next song.")
         return
+
     if name not in FILTER_PRESETS:
         await ctx.send(f"Unknown filter. Available: {', '.join(valid)}")
         return
+
+    # A named DSP preset replaces the previous preset to prevent multiple
+    # filters stacking accidentally and causing clipping/CPU load.
     active_filters[guild_id] = name
-    await ctx.send(f"🎚 Filter **{name}** applied — applies from the next song (use `mrestart` to hear it now).")
+    bass_levels[guild_id] = 0
+    await ctx.send(
+        f"🎚 Filter **{name}** enabled. It will apply from the next song "
+        f"(use `{get_prefix(bot, ctx.message)}filter clear` to remove it)."
+    )
+
+
+@bot.command(name="quality")
+async def quality(ctx):
+    """Show the audio pipeline configuration."""
+    guild_id = ctx.guild.id
+    filter_name = active_filters.get(guild_id, "none")
+    bass = get_bass(guild_id)
+    embed = discord.Embed(title="🎧 Audio Quality", color=discord.Color.blurple())
+    embed.add_field(name="Source", value="Best available audio stream", inline=False)
+    embed.add_field(name="Output", value="48 kHz • Stereo • 16-bit PCM → Discord Opus", inline=False)
+    embed.add_field(name="Active Filter", value=filter_name, inline=True)
+    embed.add_field(name="Bass", value=f"{bass:+d} dB", inline=True)
+    embed.set_footer(text="Clean/neutral mode is used by default for maximum fidelity.")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="volume")
@@ -1248,6 +1262,7 @@ async def previous(ctx):
     current = now_playing.get(guild_id)
     if current:
         get_queue(guild_id).insert(0, current["song"])
+        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         ctx.voice_client.stop()
     play_song(ctx, prev_song, seek_seconds=0)
@@ -1306,8 +1321,9 @@ async def clearqueue(ctx):
 
 @bot.command(name="search")
 async def search_cmd(ctx, *, query: str):
+    loop = asyncio.get_event_loop()
     try:
-        data = await asyncio.to_thread(ytdl_search.extract_info, query, download=False)
+        data = await loop.run_in_executor(None, lambda: ytdl_search.extract_info(query, download=False))
     except Exception as e:
         await ctx.send(f"Search failed: {e}")
         return
@@ -1484,6 +1500,9 @@ def is_dj(ctx):
 @commands.has_permissions(manage_guild=True)
 async def stay_in_vc(ctx, mode: str = None):
     guild_id = ctx.guild.id
+    if not premium_required(guild_id):
+        await ctx.send("💎 **Premium feature:** 24/7 mode is available only on Premium servers. Use `mpremium` to check your plan.")
+        return
     if mode is None:
         state = "on" if stay_247.get(guild_id) else "off"
         await ctx.send(f"24/7 mode is currently: **{state}**")
@@ -1649,7 +1668,7 @@ async def voteskip(ctx):
 MUSIC_COMMANDS = {
     "play", "skip", "pause", "resume", "stop", "queue", "shuffle", "volume",
     "bass", "loop", "autoplay", "seek", "forward", "rewind", "restart",
-    "previous", "nowplaying", "join", "leave", "voteskip",
+    "previous", "nowplaying", "join", "leave", "voteskip", "quality",
 }
 
 
@@ -1745,6 +1764,9 @@ async def welcome_leavechannel(ctx, channel: discord.TextChannel):
 @commands.has_permissions(manage_guild=True)
 async def welcome_background(ctx, url: str = None):
     guild_id = ctx.guild.id
+    if not premium_required(guild_id):
+        await ctx.send("💎 **Premium feature:** custom welcome backgrounds/GIFs are available only on Premium servers.")
+        return
     config = welcome_config.setdefault(guild_id, {})
     if url is None:
         config.pop("background_url", None)
@@ -2045,6 +2067,180 @@ async def stickyoff(ctx):
     await ctx.send("Sticky message removed.")
 
 
+# ---------- PREMIUM COMMANDS & SERVER BRANDING ----------
+async def apply_guild_profile(guild, nickname=None, avatar_bytes=None, reset_avatar=False):
+    """Apply a server-specific nickname/avatar using Discord's Modify Current Member API."""
+    url = f"https://discord.com/api/v10/guilds/{guild.id}/members/@me"
+    payload = {}
+    if nickname is not None:
+        payload["nick"] = nickname
+    if reset_avatar:
+        payload["avatar"] = None
+    elif avatar_bytes is not None:
+        payload["avatar"] = "data:image/png;base64," + base64.b64encode(avatar_bytes).decode("ascii")
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.patch(url, json=payload, timeout=15) as resp:
+            if resp.status not in (200, 204):
+                body = await resp.text()
+                raise RuntimeError(f"Discord API returned HTTP {resp.status}: {body[:300]}")
+
+
+@bot.group(name="customize", invoke_without_command=True)
+@commands.has_permissions(manage_guild=True)
+async def customize(ctx):
+    if not premium_required(ctx.guild.id):
+        await ctx.send("💎 **Premium feature:** server-specific bot branding is available only on Premium servers.\nUse `mpremium` to check your plan.")
+        return
+    await ctx.send(
+        f"💎 **Server Bot Branding**\n"
+        f"`{get_prefix(bot, ctx.message)}customize name <name>` — Set my server nickname\n"
+        f"`{get_prefix(bot, ctx.message)}customize avatar <direct-image-url>` — Set my server avatar\n"
+        f"`{get_prefix(bot, ctx.message)}customize reset` — Reset server nickname/avatar\n\n"
+        f"Current name: **{ctx.guild.me.display_name}**"
+    )
+
+
+@customize.command(name="name")
+@commands.has_permissions(manage_guild=True)
+async def customize_name(ctx, *, name: str):
+    if not premium_required(ctx.guild.id):
+        await ctx.send("💎 This is a Premium feature.")
+        return
+    name = name.strip()
+    if not 1 <= len(name) <= 32:
+        await ctx.send("❌ Bot server name must be between 1 and 32 characters.")
+        return
+    try:
+        await apply_guild_profile(ctx.guild, nickname=name)
+    except Exception as e:
+        await ctx.send(f"❌ Couldn't change my server name. Make sure I have **Change Nickname** permission.\n`{str(e)[:300]}`")
+        return
+    await ctx.send(f"✅ Premium server name changed to **{discord.utils.escape_markdown(name)}**.")
+
+
+@customize.command(name="avatar")
+@commands.has_permissions(manage_guild=True)
+async def customize_avatar(ctx, url: str):
+    if not premium_required(ctx.guild.id):
+        await ctx.send("💎 This is a Premium feature.")
+        return
+    async with ctx.typing():
+        image_bytes, error = await fetch_image_bytes(url)
+    if error:
+        await ctx.send(f"❌ {error}")
+        return
+    try:
+        # Normalize the image to PNG so Discord receives a predictable data URI.
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        out = io.BytesIO()
+        image.save(out, format="PNG", optimize=True)
+        await apply_guild_profile(ctx.guild, avatar_bytes=out.getvalue())
+    except Exception as e:
+        await ctx.send(f"❌ Couldn't change my server avatar.\n`{str(e)[:300]}`")
+        return
+    await ctx.send("✅ Premium server avatar updated.")
+
+
+@customize.command(name="reset")
+@commands.has_permissions(manage_guild=True)
+async def customize_reset(ctx):
+    if not premium_required(ctx.guild.id):
+        await ctx.send("💎 This is a Premium feature.")
+        return
+    try:
+        await apply_guild_profile(ctx.guild, nickname=None, reset_avatar=True)
+        # Discord API accepts null for nick to remove the guild nickname.
+        url = f"https://discord.com/api/v10/guilds/{ctx.guild.id}/members/@me"
+        headers = {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.patch(url, json={"nick": None}, timeout=15) as resp:
+                if resp.status not in (200, 204):
+                    raise RuntimeError(f"HTTP {resp.status}")
+    except Exception as e:
+        await ctx.send(f"❌ Couldn't reset server branding.\n`{str(e)[:300]}`")
+        return
+    await ctx.send("♻️ Server-specific bot branding has been reset.")
+
+
+@bot.group(name="premium", invoke_without_command=True)
+async def premium(ctx):
+    if ctx.guild:
+        status = premium_status_text(ctx.guild.id)
+        embed = discord.Embed(title="💎 Premium", color=discord.Color.gold())
+        embed.description = (
+            f"**Status:** {status}\n\n"
+            "Premium unlocks:\n"
+            "• 🎨 Server-specific bot name & avatar\n"
+            "• ♾️ 24/7 voice mode\n"
+            "• 🎚️ Advanced audio filters\n"
+            "• 🖼️ Custom welcome backgrounds/GIFs\n"
+            "• ✨ Premium server branding controls"
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("💎 Use `mpremium status <server_id>` to check a server's Premium status.")
+
+
+@premium.command(name="status")
+async def premium_status(ctx, server_id: str = None):
+    if server_id is None:
+        if not ctx.guild:
+            await ctx.send("Usage: `mpremium status <server_id>`")
+            return
+        server_id = str(ctx.guild.id)
+    if not server_id.isdigit():
+        await ctx.send("❌ Invalid server ID.")
+        return
+    await ctx.send(f"💎 Premium status for `{server_id}`: **{premium_status_text(int(server_id))}**")
+
+
+@premium.command(name="add")
+@commands.is_owner()
+async def premium_add(ctx, server_id: str, days: int = None):
+    if not server_id.isdigit():
+        await ctx.send("❌ Invalid server ID.")
+        return
+    if days is not None and days <= 0:
+        await ctx.send("❌ Days must be greater than 0.")
+        return
+    expires_at = None
+    if days is not None:
+        expires_at = datetime.datetime.now(datetime.timezone.utc).timestamp() + days * 86400
+    premium_guilds[str(server_id)] = {"expires_at": expires_at, "granted_at": datetime.datetime.now(datetime.timezone.utc).timestamp()}
+    save_premium_data()
+    guild = bot.get_guild(int(server_id))
+    name = guild.name if guild else "Unknown server"
+    duration = "lifetime" if days is None else f"{days} day(s)"
+    await ctx.send(f"✅ **Premium enabled** for **{name}** (`{server_id}`) for **{duration}**.")
+
+
+@premium.command(name="remove")
+@commands.is_owner()
+async def premium_remove(ctx, server_id: str):
+    if not server_id.isdigit():
+        await ctx.send("❌ Invalid server ID.")
+        return
+    removed = premium_guilds.pop(str(server_id), None)
+    save_premium_data()
+    await ctx.send("✅ Premium removed." if removed else "ℹ️ That server was not Premium.")
+
+
+@premium.command(name="list")
+@commands.is_owner()
+async def premium_list(ctx):
+    if not premium_guilds:
+        await ctx.send("💎 No Premium servers are currently active.")
+        return
+    lines = []
+    for gid in list(premium_guilds):
+        if not premium_active(int(gid)):
+            continue
+        guild = bot.get_guild(int(gid))
+        lines.append(f"• **{guild.name if guild else 'Unknown'}** — `{gid}` — {premium_status_text(int(gid))}")
+    await ctx.send("💎 **Premium Servers**\n" + ("\n".join(lines) if lines else "None"))
+
+
 BOT_NAME = "TORMENTA MUSIC 2"
 
 HELP_CATEGORIES = {
@@ -2071,6 +2267,7 @@ HELP_CATEGORIES = {
             f"`{p}seek <mm:ss>` — Jump to a position\n"
             f"`{p}forward [secs]` / `{p}rewind [secs]` — Skip forward/back\n"
             f"`{p}lyrics [song]` — Get lyrics\n"
+            f"`{p}quality` — Show high-quality audio pipeline\n"
             f"`{p}autoplay [on/off]` — Auto-continue with related songs"
         ),
     },
@@ -2085,8 +2282,8 @@ HELP_CATEGORIES = {
             f"`{p}filter 8d` — Rotating 8D audio effect\n"
             f"`{p}filter karaoke` — Reduce vocals\n"
             f"`{p}filter treble` — Boost the treble\n"
-            f"`{p}filter clear` — Remove all filters\n"
-            f"`{p}bass [0-20]` — View/set bass boost level"
+            f"`{p}filter clear` — Remove all filters / return to clean audio\n"
+            f"`{p}bass [0-20]` — View/set bass boost level (0 = clean)"
         ),
     },
     "playlists": {
@@ -2143,6 +2340,21 @@ HELP_CATEGORIES = {
             f"`{p}reload` — Refresh settings"
         ),
     },
+    "premium": {
+        "label": "Premium",
+        "desc": "Premium-only server customization & audio features",
+        "emoji": "💎",
+        "commands": lambda p: (
+            f"`{p}premium` — View Premium status & benefits\n"
+            f"`{p}customize` — Premium server branding menu\n"
+            f"`{p}customize name <name>` — Set my server name\n"
+            f"`{p}customize avatar <direct-image-url>` — Set my server avatar\n"
+            f"`{p}customize reset` — Reset server branding\n"
+            f"`{p}247 on/off` — 24/7 voice mode\n"
+            f"`{p}filter <name>` — Premium audio filters\n"
+            f"`{p}welcome background <image-url>` — Premium welcome background/GIF"
+        ),
+    },
     "general": {
         "label": "General",
         "desc": "General utility commands",
@@ -2180,33 +2392,32 @@ HELP_CATEGORIES = {
 }
 
 
-def build_welcome_embed(prefix):
+def build_welcome_embed(prefix, guild=None):
+    premium_state = premium_status_text(guild.id) if guild else "Unknown"
     embed = discord.Embed(
-        title=f"Welcome! Let's Get Started with {BOT_NAME}",
+        title=f"🎶 {BOT_NAME} • Help Center",
         description=(
-            f"**About {BOT_NAME}**\n"
-            "A simple, high-quality music bot built for great sound and easy use.\n\n"
-            "**Supported Platforms**\nYouTube • SoundCloud\n\n"
-            "**Features**\nCustom aliases • Audio filters • Playlist management • "
-            "Voice activity logs • Moderation tools • And much more!\n\n"
-            f"**Quick Start**\n"
-            f"1. Join a voice channel\n"
-            f"2. Type `{prefix}play [song name]`\n"
-            f"3. Explore commands below!\n\n"
-            "📋 **Browse Commands by Category**"
+            f"**{BOT_NAME}** is a feature-rich music bot built for smooth playback, server tools and customization.\n\n"
+            "🎵 **Music**  •  🎚️ **Audio**  •  📂 **Playlists**\n"
+            "🛡️ **Moderation**  •  🔧 **Configuration**  •  🎉 **Welcome & Levels**\n"
+            f"💎 **Premium:** {premium_state}\n\n"
+            f"**Quick Start**\n① Join a voice channel\n② `{prefix}play <song>`\n③ Use the menu below to explore commands\n\n"
+            "Select a category to see detailed commands."
         ),
         color=discord.Color.dark_teal(),
     )
-    if bot.user and bot.user.avatar:
-        embed.set_thumbnail(url=bot.user.avatar.url)
-    embed.set_footer(text=f"Prefix: {prefix} • Use the menu below to explore")
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="🌐 Supported", value="YouTube • SoundCloud", inline=True)
+    embed.add_field(name="⚡ Prefix", value=f"`{prefix}`", inline=True)
+    embed.set_footer(text="Use the buttons below • Help Center")
     return embed
 
 
 def build_category_embed(key, prefix):
     data = HELP_CATEGORIES[key]
     embed = discord.Embed(
-        title=f"{data['emoji']} {data['label']} Commands",
+        title=f"{data['emoji']} {data['label']}",
         description=data["commands"](prefix),
         color=discord.Color.dark_teal(),
     )
@@ -2215,63 +2426,62 @@ def build_category_embed(key, prefix):
 
 
 def build_all_commands_embed(prefix):
-    embed = discord.Embed(
-        title=f"📖 {BOT_NAME} — All Commands",
-        color=discord.Color.dark_teal(),
-    )
+    embed = discord.Embed(title=f"📖 {BOT_NAME} — All Commands", color=discord.Color.dark_teal())
     for data in HELP_CATEGORIES.values():
-        embed.add_field(
-            name=f"{data['emoji']} {data['label']}",
-            value=data["commands"](prefix),
-            inline=False,
-        )
-    embed.set_footer(text=f"Prefix: {prefix}")
+        embed.add_field(name=f"{data['emoji']} {data['label']}", value=data["commands"](prefix), inline=False)
+    embed.set_footer(text=f"Prefix: {prefix} • Help Center")
     return embed
 
 
 class HelpBackView(discord.ui.View):
-    def __init__(self, prefix):
-        super().__init__(timeout=180)
+    def __init__(self, prefix, guild_id=None):
+        super().__init__(timeout=300)
         self.prefix = prefix
+        self.guild_id = guild_id
 
-    @discord.ui.button(label="Back to Help Menu", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Home", style=discord.ButtonStyle.secondary, emoji="🏠")
     async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_welcome_embed(self.prefix)
-        await interaction.response.edit_message(embed=embed, view=HelpSelectView(self.prefix))
+        guild = bot.get_guild(self.guild_id) if self.guild_id else interaction.guild
+        await interaction.response.edit_message(embed=build_welcome_embed(self.prefix, guild), view=HelpSelectView(self.prefix, self.guild_id))
 
 
 class HelpCategorySelect(discord.ui.Select):
-    def __init__(self, prefix):
+    def __init__(self, prefix, guild_id=None):
         self.prefix = prefix
+        self.guild_id = guild_id
         options = [
             discord.SelectOption(label=data["label"], description=data["desc"], value=key, emoji=data["emoji"])
             for key, data in HELP_CATEGORIES.items()
         ]
-        super().__init__(placeholder="Choose a category to explore...", options=options)
+        super().__init__(placeholder="📚 Choose a command category...", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         key = self.values[0]
-        embed = build_category_embed(key, self.prefix)
-        await interaction.response.edit_message(embed=embed, view=HelpBackView(self.prefix))
+        await interaction.response.edit_message(embed=build_category_embed(key, self.prefix), view=HelpBackView(self.prefix, self.guild_id))
 
 
 class HelpSelectView(discord.ui.View):
-    def __init__(self, prefix):
-        super().__init__(timeout=180)
+    def __init__(self, prefix, guild_id=None):
+        super().__init__(timeout=300)
         self.prefix = prefix
-        self.add_item(HelpCategorySelect(prefix))
+        self.guild_id = guild_id
+        self.add_item(HelpCategorySelect(prefix, guild_id))
 
-    @discord.ui.button(label="View All Commands", style=discord.ButtonStyle.success, row=1)
+    @discord.ui.button(label="All Commands", style=discord.ButtonStyle.success, emoji="📖", row=1)
     async def view_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_all_commands_embed(self.prefix)
-        await interaction.response.edit_message(embed=embed, view=HelpBackView(self.prefix))
+        await interaction.response.edit_message(embed=build_all_commands_embed(self.prefix), view=HelpBackView(self.prefix, self.guild_id))
+
+    @discord.ui.button(label="Premium", style=discord.ButtonStyle.primary, emoji="💎", row=1)
+    async def premium_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = build_category_embed("premium", self.prefix)
+        await interaction.response.edit_message(embed=embed, view=HelpBackView(self.prefix, self.guild_id))
 
 
 @bot.command(name="help")
 async def custom_help(ctx):
     prefix = get_prefix(bot, ctx.message)
-    embed = build_welcome_embed(prefix)
-    await ctx.send(embed=embed, view=HelpSelectView(prefix))
+    embed = build_welcome_embed(prefix, ctx.guild)
+    await ctx.send(embed=embed, view=HelpSelectView(prefix, ctx.guild.id if ctx.guild else None))
 
 
 if __name__ == "__main__":
