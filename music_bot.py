@@ -50,7 +50,6 @@ ytdl_format_options = {
         }
     },
 }
-
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
 # SoundCloud fallback, when YouTube blocks
@@ -127,7 +126,6 @@ def get_bass(guild_id):
 
 # Per-guild active special filter (nightcore/vaporwave/8d/karaoke/treble), None = off
 active_filters = {}
-
 FILTER_PRESETS = {
     "nightcore": "asetrate=48000*1.25,aresample=48000",
     "vaporwave": "asetrate=48000*0.8,aresample=48000",
@@ -213,7 +211,6 @@ def fetch_autoplay_song(last_song):
         data = ytdl_radio.extract_info(radio_url, download=False)
     except Exception:
         return None
-
     entries = data.get("entries") or []
     for entry in entries:
         if not entry:
@@ -277,7 +274,6 @@ class SeekModal(discord.ui.Modal, title="Jump to a position in the song"):
         except ValueError:
             await interaction.response.send_message("Please enter a valid time, e.g. `1:30`.", ephemeral=True)
             return
-
         song = info["song"]
         if song.duration and seconds > song.duration:
             await interaction.response.send_message(
@@ -287,7 +283,6 @@ class SeekModal(discord.ui.Modal, title="Jump to a position in the song"):
             return
         if seconds < 0:
             seconds = 0
-
         info["manual_stop"] = True
         self.ctx.voice_client.stop()
         play_song(self.ctx, song, seek_seconds=seconds)
@@ -425,15 +420,12 @@ def build_now_playing_embed(guild_id, song, elapsed=0):
     )
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
-
     duration_text = format_time(song.duration) if song.duration else "?"
     bar = make_progress_bar(elapsed, song.duration)
     embed.add_field(name="Progress", value=f"{format_time(elapsed)} {bar} {duration_text}", inline=False)
-
     queue_count = len(get_queue(guild_id))
     volume_pct = int(get_volume(guild_id) * 100)
     loop_mode = get_loop(guild_id)
-
     embed.add_field(name="Queue", value=str(queue_count), inline=True)
     embed.add_field(name="Volume", value=f"{volume_pct}%", inline=True)
     embed.add_field(name="Loop", value=loop_mode, inline=True)
@@ -446,15 +438,12 @@ def play_song(ctx, song, seek_seconds=0):
     import time
     guild_id = ctx.guild.id
     voice_client = ctx.voice_client
-
     opts = get_ffmpeg_options(guild_id)
     if seek_seconds > 0:
         opts = dict(opts)
         opts["before_options"] = f"-ss {seek_seconds} " + opts["before_options"]
-
     raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
     source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
-
     now_playing[guild_id] = {
         "song": song,
         "started_at": time.time(),
@@ -473,7 +462,6 @@ def play_song(ctx, song, seek_seconds=0):
             if mode == "queue":
                 get_queue(guild_id).append(song)
             get_history(guild_id).append(song)
-
             if not get_queue(guild_id) and get_autoplay(guild_id):
                 next_song = fetch_autoplay_song(song)
                 if next_song:
@@ -482,7 +470,6 @@ def play_song(ctx, song, seek_seconds=0):
             play_next(ctx)
 
     voice_client.play(source, after=after_play)
-
     embed = build_now_playing_embed(guild_id, song, elapsed=seek_seconds)
     view = MusicControls(ctx)
     asyncio.run_coroutine_threadsafe(
@@ -498,10 +485,8 @@ def play_next(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
     voice_client = ctx.voice_client
-
     if not queue or voice_client is None:
         return
-
     song = queue.pop(0)
     play_song(ctx, song, seek_seconds=0)
 
@@ -515,7 +500,6 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
-
     channel_id = message.channel.id
     if channel_id in sticky_messages:
         old = sticky_messages[channel_id]
@@ -584,7 +568,6 @@ async def send_log(guild, description, color=discord.Color.blurple()):
 
 
 # ---------- LEVELING SYSTEM ----------
-
 def xp_for_level(level):
     # Fast early levels, slows down as level increases (classic XP curve)
     return 5 * (level ** 2) + 50 * level + 100
@@ -625,15 +608,12 @@ async def grant_xp_and_announce(guild, member, amount, fallback_channel=None):
         pass
 
 
-
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
-
     guild = member.guild
     key = (guild.id, member.id)
-
     # User joined a voice channel
     if before.channel is None and after.channel is not None:
         voice_join_times[key] = datetime.datetime.utcnow()
@@ -642,11 +622,11 @@ async def on_voice_state_update(member, before, after):
             f"🔊 **{member}** joined voice channel **{after.channel.name}**",
             color=discord.Color.green(),
         )
-
     # User left a voice channel entirely
     elif before.channel is not None and after.channel is None:
         joined_at = voice_join_times.pop(key, None)
         duration_text = ""
+        seconds = 0
         if joined_at:
             seconds = (datetime.datetime.utcnow() - joined_at).total_seconds()
             duration_text = f" (stayed {format_time(seconds)})"
@@ -658,7 +638,6 @@ async def on_voice_state_update(member, before, after):
             f"🔇 **{member}** left voice channel **{before.channel.name}**{duration_text}",
             color=discord.Color.red(),
         )
-
     # User switched voice channels
     elif before.channel is not None and after.channel is not None and before.channel != after.channel:
         await send_log(
@@ -668,20 +647,115 @@ async def on_voice_state_update(member, before, after):
         )
 
 
+async def fetch_image_bytes(url):
+    """Download a URL and return image bytes only if it's actually an image.
+    Returns (bytes_or_none, error_message_or_none)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None, f"That link returned an error (HTTP {resp.status})."
+                content_type = resp.headers.get("Content-Type", "")
+                data = await resp.read()
+                if "image" not in content_type:
+                    return None, (
+                        "That doesn't look like a direct image link (I got a webpage, not an image). "
+                        "Right-click the image itself and choose **Copy Image Address** — "
+                        "Tenor page links and pin.it share links won't work."
+                    )
+                return data, None
+    except Exception:
+        return None, "I couldn't reach that link at all — please double check it."
+
+
 async def generate_welcome_banner(member, background_url=None, title="WELCOME"):
     width, height = 900, 300
 
+    # Fetch the background bytes (may be a static image or an animated GIF)
+    bg_bytes = None
     if background_url:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(background_url, timeout=10) as resp:
-                    bg_bytes = await resp.read()
-            bg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
-            bg = bg.resize((width, height))
+            bg_bytes, _ = await fetch_image_bytes(background_url)
         except Exception:
-            background_url = None
+            bg_bytes = None
 
-    if not background_url:
+    src_img = None
+    is_animated = False
+    if bg_bytes:
+        try:
+            src_img = Image.open(io.BytesIO(bg_bytes))
+            is_animated = getattr(src_img, "is_animated", False) and getattr(src_img, "n_frames", 1) > 1
+        except Exception:
+            src_img = None
+
+    # Fetch avatar once — reused on every frame if the background is animated
+    avatar, mask, ring = None, None, None
+    avatar_x, avatar_y = (width - 160) // 2, 30
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(str(member.display_avatar.replace(size=256).url), timeout=10) as resp:
+                avatar_bytes = await resp.read()
+        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((160, 160))
+        mask = Image.new("L", (160, 160), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 160, 160), fill=255)
+        ring = Image.new("RGBA", (172, 172), (0, 0, 0, 0))
+        ImageDraw.Draw(ring).ellipse((0, 0, 172, 172), fill=(255, 255, 255, 255))
+    except Exception:
+        avatar = None
+
+    try:
+        title_font = ImageFont.load_default(size=52)
+        name_font = ImageFont.load_default(size=32)
+    except TypeError:
+        title_font = ImageFont.load_default()
+        name_font = ImageFont.load_default()
+
+    name_text = str(member)
+
+    def compose_frame(base_rgb):
+        frame = base_rgb.convert("RGB").resize((width, height)).convert("RGBA")
+        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 90))
+        frame = Image.alpha_composite(frame, overlay)
+        if avatar is not None:
+            frame.paste(ring, (avatar_x - 6, avatar_y - 6), ring)
+            frame.paste(avatar, (avatar_x, avatar_y), mask)
+        draw = ImageDraw.Draw(frame)
+        title_bbox = draw.textbbox((0, 0), title, font=title_font)
+        title_w = title_bbox[2] - title_bbox[0]
+        draw.text(((width - title_w) / 2, 205), title, font=title_font, fill=(255, 255, 255, 255))
+        name_bbox = draw.textbbox((0, 0), name_text, font=name_font)
+        name_w = name_bbox[2] - name_bbox[0]
+        draw.text(((width - name_w) / 2, 260), name_text, font=name_font, fill=(220, 220, 255, 255))
+        return frame.convert("RGB")
+
+    if is_animated:
+        # Render every frame of the source GIF with the avatar/text composited on top,
+        # so the welcome banner keeps its animation instead of freezing on frame 1.
+        MAX_FRAMES = 60  # cap to keep file size / render time reasonable
+        frames = []
+        durations = []
+        n_frames = min(src_img.n_frames, MAX_FRAMES)
+        for i in range(n_frames):
+            src_img.seek(i)
+            frames.append(compose_frame(src_img.convert("RGB")))
+            durations.append(src_img.info.get("duration", 100) or 100)
+        buffer = io.BytesIO()
+        frames[0].save(
+            buffer,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            loop=0,
+            disposal=2,
+        )
+        buffer.seek(0)
+        return discord.File(buffer, filename="welcome.gif")
+
+    # Static background image, or none provided/fetch failed -> default gradient
+    if src_img is not None:
+        bg = src_img.convert("RGB")
+    else:
         bg = Image.new("RGB", (width, height))
         top = (30, 30, 60)
         bottom = (90, 40, 120)
@@ -692,45 +766,9 @@ async def generate_welcome_banner(member, background_url=None, title="WELCOME"):
             b = int(top[2] + (bottom[2] - top[2]) * ratio)
             ImageDraw.Draw(bg).line([(0, y), (width, y)], fill=(r, g, b))
 
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 90))
-    bg = Image.alpha_composite(bg.convert("RGBA"), overlay)
-
-    # Fetch and paste circular avatar
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(str(member.display_avatar.replace(size=256).url), timeout=10) as resp:
-                avatar_bytes = await resp.read()
-        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((160, 160))
-        mask = Image.new("L", (160, 160), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, 160, 160), fill=255)
-        avatar_x, avatar_y = (width - 160) // 2, 30
-        # White ring border
-        ring = Image.new("RGBA", (172, 172), (0, 0, 0, 0))
-        ImageDraw.Draw(ring).ellipse((0, 0, 172, 172), fill=(255, 255, 255, 255))
-        bg.paste(ring, (avatar_x - 6, avatar_y - 6), ring)
-        bg.paste(avatar, (avatar_x, avatar_y), mask)
-    except Exception:
-        pass
-
-    draw = ImageDraw.Draw(bg)
-    try:
-        title_font = ImageFont.load_default(size=52)
-        name_font = ImageFont.load_default(size=32)
-    except TypeError:
-        title_font = ImageFont.load_default()
-        name_font = ImageFont.load_default()
-
-    title_bbox = draw.textbbox((0, 0), title, font=title_font)
-    title_w = title_bbox[2] - title_bbox[0]
-    draw.text(((width - title_w) / 2, 205), title, font=title_font, fill=(255, 255, 255, 255))
-
-    name_text = str(member)
-    name_bbox = draw.textbbox((0, 0), name_text, font=name_font)
-    name_w = name_bbox[2] - name_bbox[0]
-    draw.text(((width - name_w) / 2, 260), name_text, font=name_font, fill=(220, 220, 255, 255))
-
+    final_frame = compose_frame(bg)
     buffer = io.BytesIO()
-    bg.convert("RGB").save(buffer, format="PNG")
+    final_frame.save(buffer, format="PNG")
     buffer.seek(0)
     return discord.File(buffer, filename="welcome.png")
 
@@ -813,20 +851,17 @@ async def seek(ctx, position: str):
     if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await ctx.send("Nothing is playing right now.")
         return
-
     try:
         seconds = parse_time(position)
     except ValueError:
         await ctx.send("Please enter a valid time, e.g.: `mseek 1:30` or `mseek 90`")
         return
-
     song = info["song"]
     if song.duration and seconds > song.duration:
         await ctx.send(f"The song is only {format_time(song.duration)} long, you can't seek past that.")
         return
     if seconds < 0:
         seconds = 0
-
     info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=seconds)
@@ -896,20 +931,16 @@ async def play(ctx, *, query: str):
     if ctx.author.voice is None:
         await ctx.send("You need to join a voice channel first.")
         return
-
     if ctx.voice_client is None:
         await ctx.author.voice.channel.connect()
-
     await ctx.send(f"Searching: **{query}** ...")
     try:
         song = await search_song(query)
     except Exception as e:
         await ctx.send(f"Couldn't find that song: {e}")
         return
-
     queue = get_queue(ctx.guild.id)
     queue.append(song)
-
     embed = discord.Embed(
         title="Added to Queue",
         description=f"[{song.title}]({song.webpage_url})" if song.webpage_url else song.title,
@@ -918,7 +949,6 @@ async def play(ctx, *, query: str):
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
     await ctx.send(embed=embed)
-
     if not ctx.voice_client.is_playing():
         play_next(ctx)
 
@@ -976,11 +1006,9 @@ async def bass(ctx, level: int = None):
     if level is None:
         await ctx.send(f"Current bass boost: **{get_bass(guild_id)}**")
         return
-
     if level < 0 or level > 20:
         await ctx.send("Bass level must be between 0 and 20 (default 3).")
         return
-
     bass_levels[guild_id] = level
     await ctx.send(f"Bass boost set to: **{level}** — this will apply from the next song.")
 
@@ -1008,7 +1036,7 @@ async def filter_cmd(ctx, name: str = None):
         await ctx.send(f"Unknown filter. Available: {', '.join(valid)}")
         return
     active_filters[guild_id] = name
-    await ctx.send(f"🎚️ Filter **{name}** applied — applies from the next song (use `mrestart` to hear it now).")
+    await ctx.send(f"🎚 Filter **{name}** applied — applies from the next song (use `mrestart` to hear it now).")
 
 
 @bot.command(name="volume")
@@ -1018,16 +1046,12 @@ async def volume(ctx, level: int = None):
         current = int(get_volume(guild_id) * 100)
         await ctx.send(f"Current volume: **{current}%**")
         return
-
     if level < 0 or level > 100:
         await ctx.send("Volume must be between 0 and 100.")
         return
-
     volumes[guild_id] = level / 100
-
     if ctx.voice_client and ctx.voice_client.source:
         ctx.voice_client.source.volume = level / 100
-
     await ctx.send(f"Volume set to: **{level}%**")
 
 
@@ -1038,12 +1062,10 @@ async def nowplaying(ctx):
     if not info or not ctx.voice_client or not (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await ctx.send("Nothing is playing right now.")
         return
-
     song = info["song"]
     elapsed = get_elapsed(guild_id)
     if song.duration:
         elapsed = min(elapsed, song.duration)
-
     embed = build_now_playing_embed(guild_id, song, elapsed=elapsed)
     await ctx.send(embed=embed, view=MusicControls(ctx))
 
@@ -1136,7 +1158,7 @@ async def remove_song(ctx, number: int):
         await ctx.send("Invalid queue position.")
         return
     removed = queue.pop(number - 1)
-    await ctx.send(f"🗑️ Removed **{removed.title}** from the queue.")
+    await ctx.send(f"🗑 Removed **{removed.title}** from the queue.")
 
 
 @bot.command(name="clearqueue")
@@ -1233,7 +1255,6 @@ async def playlist_play(ctx, *, name: str):
         return
     if ctx.voice_client is None:
         await ctx.author.voice.channel.connect()
-
     queue = get_queue(ctx.guild.id)
     added = 0
     for entry in user_playlists[name]:
@@ -1255,7 +1276,7 @@ async def playlist_delete(ctx, *, name: str):
         del user_playlists[name]
         if playlist_active.get(ctx.author.id) == name:
             playlist_active.pop(ctx.author.id, None)
-        await ctx.send(f"🗑️ Deleted playlist **{name}**.")
+        await ctx.send(f"🗑 Deleted playlist **{name}**.")
     else:
         await ctx.send("That playlist doesn't exist.")
 
@@ -1282,7 +1303,6 @@ async def playlist_list(ctx, *, name: str = None):
 
 
 # ---------- LOGS & ADMIN CONFIG ----------
-
 @bot.command(name="setuplogs")
 @commands.has_permissions(manage_guild=True)
 async def setuplogs(ctx, channel: discord.TextChannel = None):
@@ -1350,7 +1370,6 @@ async def stay_in_vc(ctx, mode: str = None):
 async def botchannel(ctx, action: str = None, channel: discord.TextChannel = None):
     guild_id = ctx.guild.id
     allowed = bot_channels.setdefault(guild_id, set())
-
     if action is None or action == "list":
         if not allowed:
             await ctx.send("No restricted channels set — commands work everywhere.")
@@ -1358,7 +1377,6 @@ async def botchannel(ctx, action: str = None, channel: discord.TextChannel = Non
             mentions = ", ".join(f"<#{cid}>" for cid in allowed)
             await ctx.send(f"Bot commands are restricted to: {mentions}")
         return
-
     if action == "add":
         if channel is None:
             await ctx.send("Usage: `mbotchannel add #channel`")
@@ -1439,7 +1457,6 @@ async def settings_view(ctx):
     prefix = get_prefix(bot, ctx.message)
     dj_role_obj = ctx.guild.get_role(dj_roles.get(guild_id)) if dj_roles.get(guild_id) else None
     logs_channel_obj = ctx.guild.get_channel(logs_channels.get(guild_id)) if logs_channels.get(guild_id) else None
-
     embed = discord.Embed(title="⚙️ Server Settings", color=discord.Color.blurple())
     embed.add_field(name="Prefix", value=f"`{prefix}`", inline=True)
     embed.add_field(name="Volume", value=f"{int(get_volume(guild_id) * 100)}%", inline=True)
@@ -1495,7 +1512,7 @@ async def voteskip(ctx):
         votes.clear()
         await ctx.send("✅ Vote passed — skipping!")
     else:
-        await ctx.send(f"🗳️ Vote to skip: {len(votes)}/{needed}")
+        await ctx.send(f"🗳 Vote to skip: {len(votes)}/{needed}")
 
 
 MUSIC_COMMANDS = {
@@ -1574,8 +1591,10 @@ async def welcome_test(ctx):
     config = welcome_config.get(ctx.guild.id, {})
     template = config.get("join_message", DEFAULT_JOIN_MESSAGE)
     text = template.format(
-        mention=ctx.author.mention, user=str(ctx.author),
-        server=ctx.guild.name, membercount=ctx.guild.member_count,
+        mention=ctx.author.mention,
+        user=str(ctx.author),
+        server=ctx.guild.name,
+        membercount=ctx.guild.member_count,
     )
     banner = await generate_welcome_banner(ctx.author, background_url=config.get("background_url"), title="WELCOME")
     await ctx.send(content=f"**Preview:**\n{text}", file=banner)
@@ -1598,8 +1617,14 @@ async def welcome_background(ctx, url: str = None):
         config.pop("background_url", None)
         await ctx.send("Background reset to the default gradient.")
         return
+    # Validate the URL actually points to a real image before saving it
+    async with ctx.typing():
+        img_bytes, error = await fetch_image_bytes(url)
+    if error:
+        await ctx.send(f"❌ Couldn't use that image: {error}")
+        return
     config["background_url"] = url
-    await ctx.send("✅ Welcome banner background image updated.")
+    await ctx.send("✅ Welcome banner background image updated. Use `mwelcome test` to preview it.")
 
 
 @bot.command(name="level", aliases=["rank"])
@@ -1660,7 +1685,6 @@ async def lyrics(ctx, *, query: str = None):
             await ctx.send("Nothing is playing — provide a song name: `mlyrics <song>`")
             return
         query = info["song"].title
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -1673,7 +1697,6 @@ async def lyrics(ctx, *, query: str = None):
     except Exception:
         await ctx.send("Lyrics service is unavailable right now.")
         return
-
     lyrics_text = data.get("lyrics", "")
     title = data.get("title", query)
     artist = data.get("author", "Unknown")
@@ -1742,7 +1765,11 @@ async def userinfo(ctx, member: discord.Member = None):
     embed = discord.Embed(title=f"👤 {member}", color=discord.Color.blurple())
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="ID", value=str(member.id), inline=True)
-    embed.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown", inline=True)
+    embed.add_field(
+        name="Joined Server",
+        value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown",
+        inline=True,
+    )
     embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
     roles = ", ".join(r.mention for r in member.roles if r.name != "@everyone")
     embed.add_field(name="Roles", value=roles or "None", inline=False)
@@ -1820,11 +1847,9 @@ async def unban(ctx, *, user: str):
         target = discord.utils.find(lambda b: b.user.id == int(user), banned)
     else:
         target = discord.utils.find(lambda b: str(b.user) == user or b.user.name == user, banned)
-
     if target is None:
         await ctx.send("Couldn't find that user in the ban list.")
         return
-
     await ctx.guild.unban(target.user)
     await ctx.send(f"✅ Unbanned **{target.user}**.")
 
@@ -1919,7 +1944,7 @@ HELP_CATEGORIES = {
     "filters": {
         "label": "Filters",
         "desc": "Audio filter commands",
-        "emoji": "🎚️",
+        "emoji": "🎚",
         "commands": lambda p: (
             f"`{p}filter bassboost` — Boost the bass\n"
             f"`{p}filter nightcore` — Speed up + pitch up\n"
@@ -1956,7 +1981,7 @@ HELP_CATEGORIES = {
     "moderation": {
         "label": "Moderation",
         "desc": "Server moderation commands",
-        "emoji": "🛡️",
+        "emoji": "🛡",
         "commands": lambda p: (
             f"`{p}ban @user [reason]` — Ban a member\n"
             f"`{p}unban <username/ID>` — Unban a member\n"
@@ -2032,9 +2057,9 @@ def build_welcome_embed(prefix):
             "**Features**\nCustom aliases • Audio filters • Playlist management • "
             "Voice activity logs • Moderation tools • And much more!\n\n"
             f"**Quick Start**\n"
-            f"1️⃣ Join a voice channel\n"
-            f"2️⃣ Type `{prefix}play [song name]`\n"
-            f"3️⃣ Explore commands below!\n\n"
+            f"1. Join a voice channel\n"
+            f"2. Type `{prefix}play [song name]`\n"
+            f"3. Explore commands below!\n\n"
             "📋 **Browse Commands by Category**"
         ),
         color=discord.Color.dark_teal(),
