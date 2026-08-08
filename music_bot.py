@@ -771,28 +771,11 @@ async def generate_welcome_banner(member, background_url=None, title="WELCOME"):
     except Exception:
         avatar = None
 
-    try:
-        title_font = ImageFont.load_default(size=52)
-    except TypeError:
-        title_font = ImageFont.load_default()
-
     def compose_frame(base_rgb):
         frame = base_rgb.convert("RGB").resize((width, height)).convert("RGBA")
-        # Light tint only — enough for the white title text to stay readable
-        # without washing out the background gif/image.
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 55))
-        frame = Image.alpha_composite(frame, overlay)
         if avatar is not None:
             frame.paste(ring, (avatar_x - 4, avatar_y - 4), ring)
             frame.paste(avatar, (avatar_x, avatar_y), mask)
-        draw = ImageDraw.Draw(frame)
-        title_bbox = draw.textbbox((0, 0), title, font=title_font)
-        title_w = title_bbox[2] - title_bbox[0]
-        title_h = title_bbox[3] - title_bbox[1]
-        draw.text(
-            ((width - title_w) / 2, (height - title_h) / 2 - title_bbox[1]),
-            title, font=title_font, fill=(255, 255, 255, 255),
-        )
         return frame.convert("RGB")
 
     if is_animated:
