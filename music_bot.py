@@ -112,6 +112,8 @@ bot_channels = {}
 command_aliases = {}
 # Per-guild active vote-skip votes: {guild_id: set(user_id)}
 voteskip_votes = {}
+# Background tasks used by playback callbacks (one per guild).
+playback_tasks = {}
 
 
 def get_queue(guild_id):
@@ -183,17 +185,12 @@ class Song:
 
 
 async def search_song(query):
-    loop = asyncio.get_event_loop()
     source_name = "YouTube"
     try:
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(query, download=False)
-        )
+        data = await asyncio.to_thread(ytdl.extract_info, query, download=False)
     except Exception:
         source_name = "SoundCloud"
-        data = await loop.run_in_executor(
-            None, lambda: ytdl_sc.extract_info(query, download=False)
-        )
+        data = await asyncio.to_thread(ytdl_sc.extract_info, query, download=False)
     if "entries" in data:
         data = data["entries"][0]
     return Song(
@@ -252,11 +249,26 @@ def format_time(seconds):
 
 
 def parse_time(text):
+    """Parse seconds, mm:ss, or hh:mm:ss into a non-negative integer."""
+    text = str(text).strip()
+    if not text:
+        raise ValueError("empty time")
+
     parts = text.split(":")
-    parts = [int(p) for p in parts]
+    if len(parts) > 3:
+        raise ValueError("too many time components")
+
+    try:
+        values = [int(p) for p in parts]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid time") from exc
+
+    if any(value < 0 for value in values):
+        raise ValueError("negative time")
+
     seconds = 0
-    for p in parts:
-        seconds = seconds * 60 + p
+    for value in values:
+        seconds = seconds * 60 + value
     return seconds
 
 
@@ -347,7 +359,6 @@ class MusicControls(discord.ui.View):
         current = now_playing.get(guild_id)
         if current:
             get_queue(guild_id).insert(0, current["song"])
-            now_playing[guild_id]["manual_stop"] = True
         vc = self.ctx.voice_client
         if vc:
             try:
@@ -418,8 +429,8 @@ class MusicControls(discord.ui.View):
         guild_id = self.ctx.guild.id
         queue = get_queue(guild_id)
         queue.clear()
-        if guild_id in now_playing:
-            now_playing[guild_id]["manual_stop"] = True
+        now_playing.pop(guild_id, None)
+        voteskip_votes.pop(guild_id, None)
         vc = self.ctx.voice_client
         if vc:
             try:
@@ -432,8 +443,8 @@ class MusicControls(discord.ui.View):
     async def disconnect_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = self.ctx.guild.id
         get_queue(guild_id).clear()
-        if guild_id in now_playing:
-            now_playing[guild_id]["manual_stop"] = True
+        now_playing.pop(guild_id, None)
+        voteskip_votes.pop(guild_id, None)
         vc = self.ctx.voice_client
         if vc:
             try:
@@ -480,59 +491,137 @@ def build_now_playing_embed(guild_id, song, elapsed=0):
     return embed
 
 
+async def _handle_playback_finished(ctx, song, playback_token, error):
+    """Handle FFmpeg completion without blocking Discord's audio callback thread."""
+    guild_id = ctx.guild.id
+    info = now_playing.get(guild_id)
+
+    # Ignore stale callbacks from a song that was manually stopped/restarted.
+    if not info or info.get("playback_token") is not playback_token:
+        return
+
+    if error:
+        print(f"Playback error in guild {guild_id}: {error}")
+
+    mode = get_loop(guild_id)
+    if mode == "one":
+        play_song(ctx, song, seek_seconds=0)
+        return
+
+    if mode == "queue":
+        get_queue(guild_id).append(song)
+
+    get_history(guild_id).append(song)
+
+    if not get_queue(guild_id) and get_autoplay(guild_id):
+        # yt-dlp is blocking; never run it on the audio callback thread.
+        try:
+            next_song = await asyncio.to_thread(fetch_autoplay_song, song)
+        except Exception as exc:
+            print(f"Autoplay lookup failed in guild {guild_id}: {exc}")
+            next_song = None
+
+        # The user may have pressed stop/seek while autoplay was searching.
+        current = now_playing.get(guild_id)
+        if current and current.get("playback_token") is playback_token:
+            if next_song:
+                play_song(ctx, next_song, seek_seconds=0)
+                return
+
+    current = now_playing.get(guild_id)
+    if current and current.get("playback_token") is playback_token:
+        # Mark the old playback as finished before advancing.
+        current["finished"] = True
+        play_next(ctx)
+
+
 def play_song(ctx, song, seek_seconds=0):
     """Play a specific song from a specific position (seconds)."""
     guild_id = ctx.guild.id
     voice_client = ctx.voice_client
+    if voice_client is None or not voice_client.is_connected():
+        return
+
+    seek_seconds = max(0, int(seek_seconds))
     opts = get_ffmpeg_options(guild_id)
     if seek_seconds > 0:
         opts = dict(opts)
         opts["before_options"] = f"-ss {seek_seconds} " + opts["before_options"]
-    raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
-    source = discord.PCMVolumeTransformer(raw_source, volume=get_volume(guild_id))
+
+    try:
+        raw_source = discord.FFmpegPCMAudio(song.source_url, **opts)
+        source = discord.PCMVolumeTransformer(
+            raw_source, volume=get_volume(guild_id)
+        )
+    except Exception as exc:
+        print(f"Failed to create FFmpeg source for '{song.title}': {exc}")
+        # Advance to the next queued item instead of leaving the queue stuck.
+        if get_queue(guild_id):
+            play_next(ctx)
+        return
+
+    # A unique token makes old FFmpeg callbacks harmless after skip/seek/restart.
+    playback_token = object()
     now_playing[guild_id] = {
         "song": song,
         "started_at": time.time(),
         "seek_offset": seek_seconds,
+        "playback_token": playback_token,
+        "finished": False,
     }
     voteskip_votes.pop(guild_id, None)
 
     def after_play(error):
-        if error:
-            print(f"Playback error: {error}")
-        if now_playing.get(guild_id, {}).get("song") is song and not now_playing[guild_id].get("manual_stop"):
-            mode = get_loop(guild_id)
-            if mode == "one":
-                play_song(ctx, song, seek_seconds=0)
-                return
-            if mode == "queue":
-                get_queue(guild_id).append(song)
-            get_history(guild_id).append(song)
-            if not get_queue(guild_id) and get_autoplay(guild_id):
-                next_song = fetch_autoplay_song(song)
-                if next_song:
-                    play_song(ctx, next_song, seek_seconds=0)
-                    return
-            play_next(ctx)
+        # This callback runs on discord.py's audio thread. Keep it tiny.
+        future = asyncio.run_coroutine_threadsafe(
+            _handle_playback_finished(ctx, song, playback_token, error),
+            bot.loop,
+        )
+        playback_tasks[guild_id] = future
 
-    voice_client.play(source, after=after_play)
+    try:
+        voice_client.play(source, after=after_play)
+    except (discord.ClientException, RuntimeError) as exc:
+        print(f"Failed to start playback in guild {guild_id}: {exc}")
+        info = now_playing.get(guild_id)
+        if info and info.get("playback_token") is playback_token:
+            now_playing.pop(guild_id, None)
+        return
+
     embed = build_now_playing_embed(guild_id, song, elapsed=seek_seconds)
     view = MusicControls(ctx)
-    asyncio.run_coroutine_threadsafe(
-        ctx.send(embed=embed, view=view), bot.loop
-    )
-    asyncio.run_coroutine_threadsafe(
-        send_log(ctx.guild, f"🎵 **{ctx.author}** is now playing **{song.title}** in **{voice_client.channel.name}**"),
-        bot.loop,
-    )
+
+    async def announce():
+        try:
+            await ctx.send(embed=embed, view=view)
+        except discord.HTTPException as exc:
+            print(f"Failed to send now-playing message: {exc}")
+
+        try:
+            channel_name = voice_client.channel.name if voice_client.channel else "voice channel"
+            await send_log(
+                ctx.guild,
+                f"🎵 **{ctx.author}** is now playing **{song.title}** in **{channel_name}**",
+            )
+        except Exception as exc:
+            print(f"Failed to send playback log: {exc}")
+
+    asyncio.run_coroutine_threadsafe(announce(), bot.loop)
 
 
 def play_next(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
     voice_client = ctx.voice_client
-    if not queue or voice_client is None:
+
+    if voice_client is None or not voice_client.is_connected():
         return
+    if voice_client.is_playing() or voice_client.is_paused():
+        return
+    if not queue:
+        now_playing.pop(guild_id, None)
+        return
+
     song = queue.pop(0)
     play_song(ctx, song, seek_seconds=0)
 
@@ -912,7 +1001,6 @@ async def seek(ctx, position: str):
         return
     if seconds < 0:
         seconds = 0
-    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=seconds)
 
@@ -925,7 +1013,6 @@ async def restart(ctx):
         await ctx.send("Nothing is playing right now.")
         return
     song = info["song"]
-    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=0)
 
@@ -941,7 +1028,6 @@ async def forward(ctx, seconds: int = 10):
     song = info["song"]
     if song.duration and new_pos > song.duration:
         new_pos = song.duration
-    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=new_pos)
 
@@ -957,7 +1043,6 @@ async def rewind(ctx, seconds: int = 10):
     if new_pos < 0:
         new_pos = 0
     song = info["song"]
-    info["manual_stop"] = True
     ctx.voice_client.stop()
     play_song(ctx, song, seek_seconds=new_pos)
 
@@ -999,7 +1084,7 @@ async def play(ctx, *, query: str):
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
     await ctx.send(embed=embed)
-    if not ctx.voice_client.is_playing():
+    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
         play_next(ctx)
 
 
@@ -1031,18 +1116,21 @@ async def stop(ctx):
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
     queue.clear()
-    if guild_id in now_playing:
-        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
-        ctx.voice_client.stop()
+        try:
+            ctx.voice_client.stop()
+        except discord.ClientException:
+            pass
+    now_playing.pop(guild_id, None)
+    voteskip_votes.pop(guild_id, None)
     await ctx.send("Stopped and cleared the queue.")
 
 
 @bot.command(name="leave", aliases=["disconnect"])
 async def leave(ctx):
     guild_id = ctx.guild.id
-    if guild_id in now_playing:
-        now_playing[guild_id]["manual_stop"] = True
+    now_playing.pop(guild_id, None)
+    voteskip_votes.pop(guild_id, None)
     if ctx.voice_client:
         channel_name = ctx.voice_client.channel.name
         await ctx.voice_client.disconnect()
@@ -1160,7 +1248,6 @@ async def previous(ctx):
     current = now_playing.get(guild_id)
     if current:
         get_queue(guild_id).insert(0, current["song"])
-        now_playing[guild_id]["manual_stop"] = True
     if ctx.voice_client:
         ctx.voice_client.stop()
     play_song(ctx, prev_song, seek_seconds=0)
@@ -1219,9 +1306,8 @@ async def clearqueue(ctx):
 
 @bot.command(name="search")
 async def search_cmd(ctx, *, query: str):
-    loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, lambda: ytdl_search.extract_info(query, download=False))
+        data = await asyncio.to_thread(ytdl_search.extract_info, query, download=False)
     except Exception as e:
         await ctx.send(f"Search failed: {e}")
         return
